@@ -1,5 +1,17 @@
 # Versions
 
+## 0.4.0
+
+- L'écran de la tablette n'est plus un bloc de 14 Mo mais des couches servies
+  en cascade : l'habillage d'un client, les illustrations de référence, la
+  page. Le premier qui a le fichier gagne. Corriger la page ne fait plus
+  descendre que 440 Ko, et un habillage qui ne redessine que douze appareils
+  n'a aucun trou — le reste vient de la couche du dessous.
+- On revient en arrière couche par couche : défaire une mauvaise page ne
+  retélécharge pas 40 Mo d'illustrations qui n'y sont pour rien.
+- Rien à faire sur un boîtier déjà installé : l'ancien paquet unique reste
+  servi, en dernier recours, et les couches le remplacent l'une après l'autre.
+
 ## 0.3.6
 
 - La mise à jour de l'agent fonctionne enfin. Elle envoyait une version au

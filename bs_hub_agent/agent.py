@@ -21,8 +21,9 @@ import hashlib
 import json
 import os
 import time
-import urllib.request
 import urllib.error
+import urllib.parse
+import urllib.request
 
 # La version de l'agent, telle qu'elle remonte dans la flotte et telle que
 # `min_agent_version` la compare.
@@ -306,8 +307,72 @@ PAD_MAX_OCTETS = 64 * 1024 * 1024       # un paquet plus gros que ça est suspec
 PAD_GARDE = 3                            # versions conservées (pour revenir en arrière)
 
 
-def _pad_chemins():
-    return (os.path.join(PAD_RACINE, "versions"), os.path.join(PAD_RACINE, "courant"))
+# ---------------------------------------------------------------------
+# L'ÉCRAN DE LA TABLETTE EST FAIT DE COUCHES QUI NE CHANGENT PAS AU MÊME
+# RYTHME.
+#
+# C'était un bloc de 14 Mo. Corriger une ligne de la page obligeait donc
+# chaque boîtier à retélécharger 14 Mo — dont 13,5 strictement identiques.
+# Et le jour où un client a ses propres illustrations, ce bloc devient un
+# bloc PAR CLIENT : une correction de la page se refabrique autant de fois
+# qu'il y a de clients.
+#
+# On sert donc plusieurs dossiers, consultés dans cet ordre. Le premier qui
+# a le fichier gagne :
+#
+#   habillage      ce qui est propre à un client, et rien d'autre
+#   illustrations  les images et les polices — lourdes, rarement changées
+#   page           index.html, sw.js, manifest.json — 440 Ko, souvent changée
+#   complet        l'ANCIEN paquet unique
+#
+# ⚠️ `complet` est en dernier, et c'est ce qui rend la bascule indolore : un
+# boîtier déjà en service ne connaît que lui, ne voit aucune autre couche,
+# et continue de servir exactement la même chose. Il passe aux couches
+# l'une après l'autre, sans jour de bascule et sans écran noir.
+# ---------------------------------------------------------------------
+COUCHES = ("habillage", "illustrations", "page", "complet")
+
+
+def _pad_chemins(couche="complet"):
+    """Où vivent les versions d'une couche, et quel lien désigne celle servie.
+
+    `complet` garde l'emplacement historique : un boîtier déjà installé n'a
+    rien à déménager."""
+    if couche == "complet":
+        return (os.path.join(PAD_RACINE, "versions"), os.path.join(PAD_RACINE, "courant"))
+    if couche not in COUCHES:
+        raise ValueError("couche inconnue : " + str(couche))
+    base = os.path.join(PAD_RACINE, "couches", couche)
+    return (os.path.join(base, "versions"), os.path.join(base, "courant"))
+
+
+def _chemin_dans_couches(chemin_url):
+    """Le fichier demandé, cherché couche par couche dans l'ordre.
+
+    Rend le chemin de la PREMIÈRE couche qui l'a. Si personne ne l'a, rend le
+    chemin de la dernière couche : le serveur répondra 404, ce qui est la
+    vérité. Rend None si la demande cherche à sortir des couches."""
+    chemin = urllib.parse.unquote(chemin_url.split("?", 1)[0].split("#", 1)[0])
+    morceaux = []
+    for m in chemin.split("/"):
+        if not m or m == ".":
+            continue
+        # On REFUSE une demande qui remonte, on ne la corrige pas : un chemin
+        # qu'il faut réparer est un chemin qu'on n'a pas compris.
+        if m == ".." or "\0" in m:
+            return None
+        morceaux.append(m)
+    if chemin.endswith("/") or not morceaux:
+        morceaux.append("index.html")
+
+    repli = None
+    for couche in COUCHES:
+        _, courant = _pad_chemins(couche)
+        candidat = os.path.join(courant, *morceaux)
+        if os.path.exists(candidat):
+            return candidat
+        repli = candidat
+    return repli
 
 
 # ---------------------------------------------------------------------
@@ -383,14 +448,29 @@ def version_config_pad():
         return None
 
 
-def version_pad_servie():
+def version_pad_servie(couche="complet"):
     """La version actuellement servie — lue sur le disque, pas mémorisée.
     L'agent reste sans état : la vérité est ce qui existe."""
-    _, courant = _pad_chemins()
+    _, courant = _pad_chemins(couche)
     try:
         return os.path.basename(os.path.realpath(courant)) if os.path.islink(courant) else None
     except OSError:
         return None
+
+
+def couches_servies():
+    """Ce que ce boîtier sert, couche par couche. C'est CE compte rendu qui
+    déclenche la suite : le serveur n'envoie une couche que s'il sait déjà ce
+    qui est en place (sinon on expédierait 40 Mo à l'aveugle)."""
+    servies = {}
+    for couche in COUCHES:
+        try:
+            v = version_pad_servie(couche)
+        except Exception:
+            v = None
+        if v:
+            servies[couche] = v
+    return servies
 
 
 def version_page_servie():
@@ -405,10 +485,16 @@ def version_page_servie():
     littéralement indétectable.
 
     Le paquet embarque désormais `version.txt` : la même empreinte que celle
-    que la page annonce. Ici on la lit ; ailleurs on la compare."""
-    _, courant = _pad_chemins()
+    que la page annonce. Ici on la lit ; ailleurs on la compare.
+
+    Lu À TRAVERS LES COUCHES : le fichier vient de la couche `page` sur un
+    boîtier découpé, de `complet` sur un boîtier d'avant. Le même code répond
+    dans les deux cas."""
+    chemin = _chemin_dans_couches("/version.txt")
+    if not chemin:
+        return None
     try:
-        with open(os.path.join(courant, "version.txt"), encoding="utf-8") as f:
+        with open(chemin, encoding="utf-8") as f:
             return (f.read().strip() or None)
     except OSError:
         return None
@@ -474,7 +560,7 @@ def _extraire_sur(zf, cible):
     zf.extractall(racine)
 
 
-def deployer_pad(version, url, empreinte):
+def deployer_pad(version, url, empreinte, couche="complet"):
     """Télécharge, VÉRIFIE, déballe, puis bascule d'un coup.
 
     L'ordre compte : rien n'est mis en service tant que l'empreinte n'est pas
@@ -485,14 +571,14 @@ def deployer_pad(version, url, empreinte):
     if not (version and url and empreinte):
         raise ValueError("version, url et empreinte sont tous obligatoires")
 
-    versions, courant = _pad_chemins()
+    versions, courant = _pad_chemins(couche)
     os.makedirs(versions, exist_ok=True)
     cible = os.path.join(versions, str(version))
 
     if os.path.isdir(cible):
         # déjà là (re-livraison d'une commande) : on rebascule et c'est tout
         _basculer(courant, cible)
-        return {"version": version, "note": "déjà présente, remise en service"}
+        return {"couche": couche, "version": version, "note": "déjà présente, remise en service"}
 
     tmp = cible + ".tmp"
     shutil.rmtree(tmp, ignore_errors=True)
@@ -528,7 +614,7 @@ def deployer_pad(version, url, empreinte):
 
     _basculer(courant, cible)
     _purger_versions(versions, courant)
-    return {"version": version, "octets": lu, "empreinte": empreinte}
+    return {"couche": couche, "version": version, "octets": lu, "empreinte": empreinte}
 
 
 def _basculer(courant, cible):
@@ -556,18 +642,21 @@ def _purger_versions(versions, courant):
             shutil.rmtree(p, ignore_errors=True)
 
 
-def versions_pad_disponibles():
-    versions, _ = _pad_chemins()
+def versions_pad_disponibles(couche="complet"):
+    versions, _ = _pad_chemins(couche)
     if not os.path.isdir(versions):
         return []
     return sorted(d for d in os.listdir(versions) if os.path.isdir(os.path.join(versions, d)))
 
 
-def revenir_pad(version=None):
-    """Revenir à une version déjà sur le disque. Sans argument : la précédente."""
-    versions, courant = _pad_chemins()
-    dispo = versions_pad_disponibles()
-    actuelle = version_pad_servie()
+def revenir_pad(version=None, couche="complet"):
+    """Revenir à une version déjà sur le disque. Sans argument : la précédente.
+
+    Couche par couche : on peut défaire une mauvaise page sans retélécharger
+    les 40 Mo d'illustrations, qui n'y sont pour rien."""
+    versions, courant = _pad_chemins(couche)
+    dispo = versions_pad_disponibles(couche)
+    actuelle = version_pad_servie(couche)
     if version is None:
         autres = [v for v in dispo if v != actuelle]
         if not autres:
@@ -578,7 +667,7 @@ def revenir_pad(version=None):
     if not os.path.isdir(cible):
         raise ValueError("version absente du disque : " + str(version))
     _basculer(courant, cible)
-    return {"version": version, "note": "remise en service depuis le disque"}
+    return {"couche": couche, "version": version, "note": "remise en service depuis le disque"}
 
 
 # =====================================================================
@@ -874,12 +963,28 @@ def demarrer_serveur_pad(ha_url=None, ha_token=None):
                 return
             SimpleHTTPRequestHandler.do_GET(self)
 
+        def translate_path(self, path):
+            """Où aller chercher le fichier demandé.
+
+            ⚠️ C'EST ICI QUE LA CASCADE EXISTE, et nulle part ailleurs. Le
+            serveur ne connaît plus « un » dossier : il en essaie plusieurs,
+            dans l'ordre, et rend le premier qui a le fichier. Un habillage
+            qui ne fournit que douze images n'a donc aucun trou — les
+            quarante-quatre autres viennent de la couche du dessous."""
+            resolu = _chemin_dans_couches(path)
+            # Une demande qui cherche à sortir des couches n'est pas réparée :
+            # on rend un chemin qui n'existe pas, et le serveur répond 404.
+            return resolu if resolu else os.path.join(PAD_RACINE, ".refuse")
+
         def end_headers(self):
             # la coquille ne doit jamais être servie depuis un cache périmé :
             # c'est elle qui porte la version du service worker.
             self.send_header("Cache-Control", "no-cache")
             SimpleHTTPRequestHandler.end_headers(self)
 
+    # `directory=` est conservé pour les rares chemins que la bibliothèque
+    # calcule elle-même, mais il ne décide plus rien : `translate_path` passe
+    # devant, et c'est lui qui connaît les couches.
     srv = ThreadingHTTPServer(("0.0.0.0", PAD_WEB_PORT),
                               functools.partial(Poli, directory=courant))
     cert, cle = os.environ.get("BS_PAD_CERT"), os.environ.get("BS_PAD_CLE")
@@ -1570,7 +1675,10 @@ def dispatch(cmd, ha, store, sup=None, version_ha=None, differes=None):
     if t == "hub.pad.deploy":
         # On envoie une RÉFÉRENCE, pas 14 Mo dans une commande : le hub va
         # chercher le paquet et vérifie son empreinte avant tout déballage.
-        resultat = deployer_pad(p.get("version"), p.get("url"), p.get("sha256"))
+        # Sans couche : l'ancien paquet unique. Un boîtier d'avant reçoit donc
+        # exactement ce qu'il recevait.
+        resultat = deployer_pad(p.get("version"), p.get("url"), p.get("sha256"),
+                                p.get("couche") or "complet")
         # Déployer ne suffit pas : la tablette affiche toujours l'ancienne
         # page tant que personne ne la recharge (constaté au Raspberry).
         marquer_pad_a_rafraichir(p.get("version"))
@@ -1590,7 +1698,7 @@ def dispatch(cmd, ha, store, sup=None, version_ha=None, differes=None):
         # Les versions précédentes sont restées sur le disque : revenir en
         # arrière ne demande aucun réseau. C'est le point important — on peut
         # réparer une mauvaise interface même si le cloud est injoignable.
-        return "acked", revenir_pad(p.get("version"))
+        return "acked", revenir_pad(p.get("version"), p.get("couche") or "complet")
 
     if t == "hub.versions":
         # « qui tourne sur quoi » — la base de la matrice de compatibilité.
@@ -1918,6 +2026,9 @@ def instantane_sante(ha, sup=None, store=None):
 
     try:
         snap["pad_version_servie"] = version_pad_servie()
+        # LE compte rendu qui déclenche l'envoi des couches : le serveur
+        # n'expédie une couche que s'il sait déjà ce qui est en place.
+        snap["pad_couches_servies"] = couches_servies()
         # L'empreinte de la PAGE servie, dans le même vocabulaire que celle
         # que la tablette annonce : c'est la seule paire comparable, donc la
         # seule façon de savoir qu'un pad affiche une interface périmée.
