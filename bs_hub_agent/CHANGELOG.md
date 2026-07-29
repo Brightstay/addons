@@ -1,5 +1,12 @@
 # Versions
 
+## 0.3.1
+
+- L'adresse du serveur et la clé du logement peuvent être saisies dans l'écran
+  de l'add-on. Elles venaient uniquement de l'image préparée en atelier :
+  impossible d'installer l'agent sur un Home Assistant ordinaire.
+- Si elles manquent, l'add-on le dit en clair au lieu de planter.
+
 ## 0.3.0
 
 - Répond à la demande d'inventaire : l'hôte range ses appareils depuis son
