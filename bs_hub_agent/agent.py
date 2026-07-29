@@ -24,6 +24,15 @@ import time
 import urllib.request
 import urllib.error
 
+# La version de l'agent, telle qu'elle remonte dans la flotte et telle que
+# `min_agent_version` la compare.
+#
+# ⚠️ Ce n'est qu'un SECOURS. Sur un vrai hub, `main()` la remplace par la version
+# de l'add-on installé, que le Superviseur connaît — c'est le numéro de
+# `config.yaml`, celui que l'hôte voit dans la boutique. Sinon on aurait deux
+# numéros pour la même chose, et un add-on 0.3.2 se déclarerait 0.3.0.
+# Le secours sert au hub de développement, qui n'a pas de Superviseur.
+#
 # 0.3.0 : commande `hub.inventaire` (ce que le hub voit chez l'hôte). Un hub resté
 # en 0.2.0 la refuse — c'est visible dans le sort de la commande, et l'app le dit
 # à l'hôte au lieu de lui reprocher de ne pas avoir branché ses appareils.
@@ -1799,6 +1808,20 @@ def main():
         if jeton_sup else None
     if sup is None:
         print("[hub-agent] pas de Superviseur : entretien du hub indisponible", flush=True)
+
+    # Un seul numéro de version pour l'agent : celui de l'add-on installé. Le
+    # Superviseur le connaît, on le lui demande plutôt que d'entretenir à la
+    # main une constante qui finit toujours par retarder d'une version.
+    global AGENT_VERSION
+    if sup is not None:
+        try:
+            version_addon = (sup.info_self() or {}).get("version")
+            if version_addon:
+                AGENT_VERSION = version_addon
+        except Exception as e:
+            print("[hub-agent] version de l'add-on illisible, on garde", AGENT_VERSION, ":", e,
+                  flush=True)
+    print("[hub-agent] version", AGENT_VERSION, flush=True)
 
     # signale sa présence + sa version au démarrage (atterrit dans `evenements`)
     boot = [{"type": "info", "severity": "info",

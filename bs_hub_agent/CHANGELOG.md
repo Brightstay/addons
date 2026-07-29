@@ -1,5 +1,11 @@
 # Versions
 
+## 0.3.3
+
+- L'agent annonce la version de l'add-on installé au lieu d'un numéro écrit à
+  part dans son code. Les deux avaient déjà divergé : l'add-on 0.3.2 se
+  déclarait 0.3.0 dans la flotte.
+
 ## 0.3.2
 
 - L'add-on se fabrique enfin : il manquait le fichier qui dit sur quelle base
