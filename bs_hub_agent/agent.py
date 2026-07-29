@@ -1003,12 +1003,20 @@ def _reseaux_locaux():
     return bases[:4]                    # au-delà, c'est du balayage pour rien
 
 
-def trouver_pad(mot_de_passe, timeout=0.35):
-    """Retrouve le pad sur le réseau local.
+def trouver_pads(mot_de_passe, timeout=0.35, limite=None):
+    """TOUS les pads du réseau, dans l'ordre où on les rencontre.
 
-    Sans routeur à nous, son adresse peut changer au redémarrage de la box.
-    Plutôt que d'exiger une réservation d'adresse (personne ne le fera), le
-    hub balaie son propre réseau et cherche qui répond à Fully."""
+    Le hub n'en veut qu'un (un logement n'a qu'une tablette) et s'arrête au
+    premier — c'est `trouver_pad` juste en dessous.
+
+    ⚠️ L'ATELIER, LUI, A BESOIN DE LES VOIR TOUS. Deux tablettes neuves
+    branchées en même temps répondent toutes les deux : « la première qui
+    répond » en configurerait une au hasard, sans rien dire, et l'autre
+    partirait chez un hôte à moitié réglée.
+
+    Sans routeur à nous, l'adresse d'une tablette peut changer au redémarrage
+    de la box. Plutôt que d'exiger une réservation d'adresse (personne ne le
+    fera), on balaie le réseau et on cherche qui répond à Fully."""
     import socket
     from concurrent.futures import ThreadPoolExecutor
 
@@ -1022,6 +1030,7 @@ def trouver_pad(mot_de_passe, timeout=0.35):
         finally:
             s.close()
 
+    trouves = []
     for base in _reseaux_locaux():
         adresses = ["%s.%d" % (base, n) for n in range(1, 255)]
         with ThreadPoolExecutor(max_workers=48) as ex:
@@ -1031,10 +1040,18 @@ def trouver_pad(mot_de_passe, timeout=0.35):
                 try:
                     # port ouvert ≠ notre pad : on vérifie que c'est bien Fully
                     if Pad(ip, mot_de_passe, timeout=4).info().get("packageName"):
-                        return ip
+                        trouves.append(ip)
+                        if limite and len(trouves) >= limite:
+                            return trouves
                 except Exception:
                     pass
-    return None
+    return trouves
+
+
+def trouver_pad(mot_de_passe, timeout=0.35):
+    """Le premier pad du réseau — ce qu'il faut au hub, et rien de plus."""
+    trouves = trouver_pads(mot_de_passe, timeout, limite=1)
+    return trouves[0] if trouves else None
 
 
 def _pad(mot_de_passe=None, rebalayer=True):

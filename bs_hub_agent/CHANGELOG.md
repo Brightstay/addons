@@ -1,5 +1,12 @@
 # Versions
 
+## 0.3.4
+
+- La recherche de la tablette sait rendre TOUTES celles du réseau, et plus
+  seulement la première. Le boîtier, lui, s'arrête toujours à la première :
+  un logement n'a qu'une tablette. C'est l'atelier qui avait besoin de les
+  voir toutes, pour ne pas en régler une au hasard.
+
 ## 0.3.3
 
 - L'agent annonce la version de l'add-on installé au lieu d'un numéro écrit à
