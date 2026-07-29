@@ -1,0 +1,54 @@
+# Manifeste de l'add-on — c'est ce que Home Assistant lit pour savoir quoi
+# installer, avec quels droits, et sous quel nom l'afficher.
+name: Brightstay Hub Agent
+version: "0.3.0"
+slug: bs_hub_agent
+description: Relie le logement à Brightstay — remonte ce que voit le boîtier, applique ce qu'on lui demande, et sert la page de la tablette.
+url: https://github.com/Brightstay/addons/tree/main/bs_hub_agent
+arch: [aarch64, amd64, armv7]
+
+startup: application
+boot: auto            # démarre au boot du boîtier, relancé s'il meurt
+init: false
+
+# Parle au cœur de Home Assistant : vérifier une configuration, la recharger,
+# appeler un service (allumer une lampe, ouvrir un volet).
+homeassistant_api: true
+
+# Parle au Superviseur — la partie qui gère la machine elle-même.
+#
+# ⚠️ C'est ce qui permet au boîtier de SE RÉPARER À DISTANCE : sans cet accès,
+# il savait entretenir ses consignes mais pas la machine qui les fait tourner.
+# Il ne pouvait ni se mettre à jour lui-même, ni mettre à jour Home Assistant,
+# ni prendre une sauvegarde — et le moindre correctif imposait un déplacement
+# chez chaque client.
+#
+# Le rôle `manager` donne exactement ça : add-ons, cœur, sauvegardes, machine.
+# Et rien de plus — `admin` ajouterait la gestion des comptes et du réseau,
+# dont nous n'avons pas besoin.
+hassio_api: true
+hassio_role: manager
+
+# LE BOÎTIER SERT LA PAGE DE LA TABLETTE sur ce port.
+#
+# C'est ce qui rend le logement autonome : la tablette ne va plus chercher son
+# écran ailleurs, elle le prend dans le boîtier, sur le réseau du logement.
+# Servi en HTTPS, il démarre même quand la box internet est coupée.
+ports:
+  8099/tcp: 8099
+ports_description:
+  8099/tcp: Écran de la tablette (réseau local uniquement)
+
+map:
+  - homeassistant_config:rw   # écrire les consignes dans la configuration
+  - ssl:ro                    # le certificat du boîtier, pour servir en HTTPS
+
+options:
+  sync_interval: 300
+schema:
+  sync_interval: int(30,3600)
+
+# Les accès du boîtier — adresse du serveur, clé du logement, mot de passe de
+# sauvegarde, certificat, mot de passe de la tablette — sont posés à l'atelier,
+# dans la machine. Ils n'apparaissent NI ici NI à l'écran : ce sont des secrets
+# de mise en service, pas des réglages qu'on tourne.
