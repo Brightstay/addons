@@ -1,5 +1,16 @@
 # Versions
 
+## 0.3.5
+
+- Une annonce de la tablette ne détourne plus le boîtier. N'importe quel
+  appareil du Wi-Fi du logement pouvait s'annoncer et se faire livrer le mot
+  de passe d'administration de la tablette. L'adresse déjà connue passe
+  maintenant en premier, et l'identité de la tablette est retenue : une autre
+  machine qui répond à sa place est écartée.
+- Les commandes reçues pendant un envoi intermédiaire ne sont plus perdues :
+  elles étaient marquées « livrées » sans être exécutées, et n'étaient
+  reprises qu'après le délai de re-livraison.
+
 ## 0.3.4
 
 - La recherche de la tablette sait rendre TOUTES celles du réseau, et plus

@@ -300,8 +300,12 @@ def enregistrer_annonce(corps):
     with open(tmp, "w", encoding="utf-8") as f:
         json.dump(corps, f, ensure_ascii=False)
     os.replace(tmp, chemin)
-    if corps.get("ip"):
-        _PAD_CONNU["ip"] = corps["ip"]     # elle vient de nous donner son adresse
+    # ⛔ On n'écrase PLUS l'adresse connue ici. Une annonce n'est pas une preuve :
+    # elle n'est qu'une piste, que `_pad()` essaie APRÈS l'adresse déjà validée.
+    # Avant, un appareil quelconque du Wi-Fi pouvait s'annoncer et se faire
+    # livrer le mot de passe d'administration de la tablette.
+    if corps.get("ip") and not _PAD_CONNU.get("ip"):
+        _PAD_CONNU["ip"] = corps["ip"]     # rien de connu encore : mieux que rien
     return corps
 
 
@@ -706,6 +710,11 @@ def demarrer_serveur_pad(ha_url=None, ha_token=None):
                 enregistrer_annonce(corps)
             except Exception:
                 pass
+            # ⚠️ Une annonce ne PROUVE rien : n'importe quel appareil du Wi-Fi
+            # du logement peut en poster une. Elle est enregistrée comme une
+            # piste, et `_pad()` n'y recourt qu'après avoir échoué à joindre
+            # l'adresse déjà connue — sinon le hub serait détourné vers un
+            # inconnu à qui il enverrait le mot de passe de la tablette.
             self.send_response(204); self.end_headers()
 
         def do_GET(self):
@@ -1054,24 +1063,62 @@ def trouver_pad(mot_de_passe, timeout=0.35):
     return trouves[0] if trouves else None
 
 
+def _identite_pad(infos):
+    """De quoi reconnaître NOTRE tablette d'une autre machine du réseau.
+
+    Fully rend son adresse matérielle et son numéro de série ; l'un des deux
+    suffit et ne change pas au gré des adresses IP."""
+    if not isinstance(infos, dict):
+        return None
+    for cle in ("deviceID", "deviceId", "serial", "Mac", "mac"):
+        v = infos.get(cle)
+        if v:
+            return str(v)
+    return None
+
+
 def _pad(mot_de_passe=None, rebalayer=True):
-    """Le pad, à l'adresse qu'il a ANNONCÉE, sinon celle qu'on connaît,
-    sinon retrouvé par balayage. Dans cet ordre : une adresse annoncée est
-    toujours plus fraîche et plus sûre qu'une adresse devinée."""
+    """Le pad, à l'adresse qu'on lui connaît, sinon celle qu'il a ANNONCÉE,
+    sinon retrouvé par balayage.
+
+    ⚠️ CET ORDRE A CHANGÉ LE 29/07, ET C'EST UNE CORRECTION DE SÉCURITÉ.
+    L'adresse annoncée passait EN PREMIER. Or n'importe quel appareil du Wi-Fi
+    du logement peut poster une annonce en se donnant l'adresse qu'il veut : le
+    hub la croyait, l'appelait — et lui envoyait le MOT DE PASSE
+    d'administration de la tablette, que Fully exige à chaque appel.
+
+    Deux verrous depuis :
+      • l'adresse déjà connue est essayée d'abord ; une annonce ne sert plus
+        que si la vraie tablette ne répond plus (le cas pour lequel l'annonce
+        existe : une box qui isole les appareils entre eux) ;
+      • on retient l'identité de la tablette au premier contact réussi. Une
+        machine qui répond avec une autre identité est écartée, et on le note.
+    """
     mdp = mot_de_passe or _mdp_pad()
     if not mdp:
         return None
     candidates = []
-    a = derniere_annonce()
-    if a and a.get("ip"):
-        candidates.append(a["ip"])
-    if _PAD_CONNU.get("ip") and _PAD_CONNU["ip"] not in candidates:
+    if _PAD_CONNU.get("ip"):
         candidates.append(_PAD_CONNU["ip"])
+    a = derniere_annonce()
+    if a and a.get("ip") and a["ip"] not in candidates:
+        candidates.append(a["ip"])
     for ip in candidates:
         try:
-            if Pad(ip, mdp).info().get("packageName"):
-                _PAD_CONNU["ip"] = ip
-                return Pad(ip, mdp)
+            infos = Pad(ip, mdp).info()
+            if not infos.get("packageName"):
+                continue
+            identite = _identite_pad(infos)
+            attendue = _PAD_CONNU.get("identite")
+            if attendue and identite and identite != attendue:
+                # Quelqu'un d'autre répond à cette adresse. On ne lui parle plus.
+                print("[hub-agent] pad inattendu en %s (identité %s ≠ %s) — ignoré"
+                      % (ip, identite, attendue), flush=True)
+                continue
+            if identite and not attendue:
+                _PAD_CONNU["identite"] = identite
+            _PAD_CONNU["ip"] = ip
+            return Pad(ip, mdp)
         except Exception:
             pass
     if not rebalayer:
@@ -1847,6 +1894,9 @@ def main():
              "dedup_key": "agent-boot-" + AGENT_VERSION}]
 
     acks, evenements = [], []
+    # Commandes reçues pendant un envoi intermédiaire : le serveur les a
+    # marquées « livrées », c'est donc à nous de les exécuter — au tour suivant.
+    en_retard = []
     backoff = 5
     while True:
         try:
@@ -1865,17 +1915,26 @@ def main():
             differes = []
             rep = sync_once(hub_url, hub_key, events=boot + evenements + sante, acks=acks)
             boot, evenements = [], []                 # le boot n'est envoyé qu'une fois
-            acks = traiter(rep.get("commands", []), ha, store, sup, version_ha, differes)
+            commandes = en_retard + list(rep.get("commands", []))
+            en_retard = []
+            acks = traiter(commandes, ha, store, sup, version_ha, differes)
 
             if differes:
                 # On FAIT PARTIR les accusés (et l'annonce de début) AVANT
                 # d'agir : la suite peut nous tuer — mise à jour de l'agent —
                 # ou couper Home Assistant. Une commande sans réponse serait
                 # re-livrée sans fin ; ici, elle est déjà close.
-                sync_once(hub_url, hub_key,
-                          events=[_evt_maintenance("debut", n) for n, _ in differes],
-                          acks=acks)
+                # ⚠️ CETTE RÉPONSE NE SE JETTE PAS. Le serveur en profite pour
+                # livrer les commandes en attente : les ignorer les laissait
+                # marquées « livrées » sans que personne ne les exécute, et
+                # elles n'étaient reprises qu'après le délai de re-livraison.
+                # On les garde pour le tour suivant.
+                rep2 = sync_once(hub_url, hub_key,
+                                 events=[_evt_maintenance("debut", n) for n, _ in differes],
+                                 acks=acks)
                 acks = []
+                for c in (rep2 or {}).get("commands", []) or []:
+                    en_retard.append(c)
                 for nom, action in differes:
                     try:
                         evenements.append(_evt_maintenance("fin", nom, action()))
