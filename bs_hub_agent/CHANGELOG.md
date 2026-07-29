@@ -1,5 +1,15 @@
 # Versions
 
+## 0.3.6
+
+- La mise à jour de l'agent fonctionne enfin. Elle envoyait une version au
+  Superviseur, qui refuse d'en recevoir une : la commande échouait à tous les
+  coups. Elle demande maintenant simplement « prends ce que la boutique
+  propose », après avoir fait relire cette boutique.
+- Et elle REFUSE de le faire si la boutique ne propose pas la version que la
+  fiche du logement demande : un boîtier ne prend pas une nouveauté qui ne lui
+  était pas destinée.
+
 ## 0.3.5
 
 - Une annonce de la tablette ne détourne plus le boîtier. N'importe quel

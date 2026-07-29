@@ -209,10 +209,47 @@ class Supervisor:
         return self._req("GET", "/backups")
 
     # --- écriture (long : voir la règle ci-dessus) ---------------------
+    def recharger_boutique(self):
+        """Relire la boutique avant d'installer une version.
+
+        ⚠️ SANS ÇA, « ON DÉCIDE LA VERSION » EST UN VŒU. Le Superviseur ne relit
+        notre dépôt que de temps en temps, de lui-même. Un boîtier dont l'index
+        date d'hier ne CONNAÎT pas la version qu'on lui demande : il refuse,
+        et le refus ressemble à une panne alors que tout va bien."""
+        self._req("POST", "/store/reload", {}, timeout=300)
+        return {"boutique": "relue"}
+
+    def version_boutique(self, slug="self"):
+        """La version que la boutique propose AUJOURD'HUI pour cet add-on."""
+        infos = self._req("GET", "/addons/%s/info" % slug) or {}
+        return infos.get("version_latest")
+
     def maj_addon(self, slug="self", version=None):
-        corps = {"version": version} if version else {}
-        self._req("POST", "/addons/%s/update" % slug, corps, timeout=900)
-        return {"addon": slug, "version": version}
+        """Mettre l'add-on à jour.
+
+        ⚠️ ON NE CHOISIT PAS LA VERSION. Éprouvé sur un vrai boîtier le 29/07 :
+        le Superviseur REFUSE qu'on lui en passe une —
+        « extra keys not allowed @ data['version'] ». Son seul geste est
+        « prends ce que la boutique propose ». L'agent envoyait pourtant une
+        version : la commande échouait donc à tous les coups, et personne ne
+        l'avait vu faute de l'avoir lancée pour de vrai.
+
+        Ce qu'on garde : le droit de REFUSER. Si la fiche du logement demande
+        une version et que la boutique en propose une autre, on ne met pas à
+        jour et on le dit. C'est ce qui empêche un boîtier de prendre une
+        nouveauté qui ne lui était pas destinée."""
+        if version:
+            try:
+                self.recharger_boutique()
+            except Exception as e:
+                print("[hub-agent] boutique non relue :", e, flush=True)
+            offerte = self.version_boutique(slug)
+            if offerte != version:
+                raise ValueError(
+                    "la boutique propose %s, la fiche demande %s — le Superviseur "
+                    "n'installe que ce que la boutique offre" % (offerte, version))
+        self._req("POST", "/addons/%s/update" % slug, {}, timeout=900)
+        return {"addon": slug, "version": version or "celle de la boutique"}
 
     def maj_core(self, version):
         if not version:
@@ -616,14 +653,81 @@ def _remarquer_hub(valeur, adresse):
     return valeur.replace(adresse, MARQUE_HUB)
 
 
-def _adresse_joignable(url_ha, adresse_locale):
+# =====================================================================
+# LES ADRESSES QUI N'EXISTENT QUE DANS LA BOÎTE.
+#
+# Trouvé le 29/07/2026 sur le premier Home Assistant OS : le hub annonçait
+# à sa tablette `http://172.30.33.1:8123`. C'est le réseau privé que le
+# Superviseur crée entre ses conteneurs — une adresse parfaitement valable
+# À L'INTÉRIEUR du boîtier, et introuvable pour tout le reste du monde.
+#
+# D'où elle venait : sur HA OS, notre add-on ne tourne PAS sur le réseau de
+# la maison. Le port 8099 est traduit par Docker. `getsockname()` rend donc
+# l'adresse du conteneur, jamais celle du hub sur la box. Sur le Raspberry,
+# où l'agent tourne sans cette traduction, la même ligne rendait la bonne
+# adresse — c'est pourquoi le défaut n'était jamais apparu.
+#
+# Ces deux plages sont fixes et documentées : 172.30.32.0/23 est le réseau
+# du Superviseur, 172.17.0.0/16 le pont par défaut de Docker. Aucune box ne
+# distribue ces adresses-là.
+# =====================================================================
+PLAGES_INTERNES = ("172.30.32.", "172.30.33.", "172.17.")
+
+
+def _adresse_dans_la_maison(a):
+    """Cette adresse peut-elle être atteinte depuis la tablette ?
+
+    Non si elle est vide, si elle boucle sur elle-même, ou si elle appartient
+    au réseau privé que Docker fabrique dans le boîtier."""
+    if not a:
+        return False
+    a = a.strip().lower()
+    if a in ("127.0.0.1", "::1", "0.0.0.0", "localhost"):
+        return False
+    if a.startswith("127.") or a.startswith("169.254."):
+        return False
+    return not any(a.startswith(p) for p in PLAGES_INTERNES)
+
+
+def _adresse_annoncee(en_tete_host):
+    """L'adresse que la TABLETTE a composée pour nous joindre.
+
+    Filet quand `getsockname()` ne sert à rien (voir ci-dessus). On ne prend
+    cet en-tête que s'il porte une ADRESSE, jamais un nom : un nom, on ne peut
+    ni le vérifier ni le résoudre depuis ici, et c'est précisément ce qu'on
+    glisserait pour détourner la tablette vers un faux Home Assistant.
+
+    Le risque résiduel est nul en pratique : cet en-tête est écrit par le
+    navigateur à partir de l'adresse qu'il a lui-même composée. Le seul à
+    pouvoir le tordre est celui qui tient déjà la tablette."""
+    if not en_tete_host:
+        return None
+    h = en_tete_host.strip()
+    if h.startswith("["):                    # IPv6 littéral : [fd8c::1]:8099
+        fin = h.find("]")
+        h = h[1:fin] if fin > 0 else ""
+    else:
+        h = h.rsplit(":", 1)[0] if h.count(":") == 1 else h
+    import ipaddress as _ip
+    try:
+        adr = _ip.ip_address(h)
+    except ValueError:
+        return None                          # un nom : on ne s'y fie pas
+    if not adr.is_private or adr.is_loopback or adr.is_link_local:
+        return None
+    return h if _adresse_dans_la_maison(h) else None
+
+
+def _adresse_joignable(url_ha, adresse_locale, en_tete_host=None):
     """L'adresse de Home Assistant TELLE QUE LA TABLETTE PEUT L'ATTEINDRE.
 
     Piège principal : l'agent parle à Home Assistant par `localhost`. Servir
     cette adresse-là à la tablette lui ferait chercher Home Assistant… dans
     la tablette. On remplace donc l'hôte par l'adresse du hub SUR LAQUELLE
-    la tablette vient d'arriver — celle de la connexion en cours, qui est
-    joignable par construction et qu'aucun en-tête ne peut falsifier.
+    la tablette vient d'arriver.
+
+    Deux sources, dans cet ordre : l'adresse de la connexion en cours, puis —
+    si elle n'existe que dans le boîtier — celle que la tablette a composée.
 
     Si Home Assistant tourne AILLEURS que sur le hub, on n'y touche pas."""
     import urllib.parse as _parse
@@ -633,14 +737,40 @@ def _adresse_joignable(url_ha, adresse_locale):
     locaux = ("localhost", "127.0.0.1", "::1", "0.0.0.0", "supervisor")
     if u.hostname.lower() not in locaux:
         return url_ha.rstrip("/")            # HA est sur une autre machine
-    if not adresse_locale:
+    adresse = adresse_locale if _adresse_dans_la_maison(adresse_locale) else None
+    if adresse is None:
+        adresse = _adresse_annoncee(en_tete_host)
+    if adresse is None:
         return None                          # on préfère ne rien dire que mentir
-    hote = "[%s]" % adresse_locale if ":" in adresse_locale else adresse_locale
+    hote = "[%s]" % adresse if ":" in adresse else adresse
     port = u.port or (443 if u.scheme == "https" else 8123)
     return "%s://%s:%d" % (u.scheme or "http", hote, port)
 
 
-def config_pour_la_tablette(url_ha, jeton_ha, adresse_locale):
+def _jeton_pour_la_tablette(jeton):
+    """Un jeton que Home Assistant acceptera — ou rien du tout.
+
+    Trouvé le 29/07/2026 : l'add-on servait à la tablette le jeton du
+    SUPERVISEUR, faute d'en avoir reçu un autre. Ce jeton-là ouvre le
+    Superviseur, pas Home Assistant, qui le refuse (`auth_invalid`). La
+    tablette s'affichait donc parfaitement et ne commandait rien — sans que
+    rien, nulle part, ne dise pourquoi.
+
+    Les deux se distinguent à l'œil : un jeton Home Assistant est un JWT,
+    trois morceaux séparés par des points ; celui du Superviseur est une
+    suite de caractères sans le moindre point. On refuse donc tout ce qui
+    n'a pas la forme d'un jeton Home Assistant — mieux vaut une tablette qui
+    dit « hub non connecté » qu'une tablette muette pour une raison
+    invisible."""
+    if not jeton or not isinstance(jeton, str):
+        return None
+    morceaux = jeton.strip().split(".")
+    if len(morceaux) != 3 or not all(len(m) >= 8 for m in morceaux):
+        return None
+    return jeton.strip()
+
+
+def config_pour_la_tablette(url_ha, jeton_ha, adresse_locale, en_tete_host=None):
     """La configuration du logement + de quoi joindre Home Assistant."""
     try:
         with open(_config_chemin(), encoding="utf-8") as f:
@@ -656,10 +786,14 @@ def config_pour_la_tablette(url_ha, jeton_ha, adresse_locale):
     for cle in ACCES_RESERVES:
         conf.pop(cle, None)
 
-    adresse = _adresse_joignable(url_ha, adresse_locale)
-    if adresse and jeton_ha:
+    # Les deux ensemble, ou aucun des deux : une adresse sans jeton, ou un
+    # jeton sans adresse, laisse la tablette essayer sans fin. Et un jeton que
+    # Home Assistant refusera ne vaut pas mieux que pas de jeton du tout.
+    adresse = _adresse_joignable(url_ha, adresse_locale, en_tete_host)
+    jeton = _jeton_pour_la_tablette(jeton_ha)
+    if adresse and jeton:
         conf["ha_url"] = adresse
-        conf["ha_token"] = jeton_ha
+        conf["ha_token"] = jeton
     return conf
 
 
@@ -726,7 +860,8 @@ def demarrer_serveur_pad(ha_url=None, ha_token=None):
                 except Exception:
                     locale = None
                 corps = json.dumps(
-                    config_pour_la_tablette(ha_url, ha_token, locale),
+                    config_pour_la_tablette(ha_url, ha_token, locale,
+                                            self.headers.get("Host")),
                     ensure_ascii=False).encode("utf-8")
                 self.send_response(200)
                 self.send_header("Content-Type", "application/json; charset=utf-8")
@@ -1848,6 +1983,16 @@ def main():
     hub_key = os.environ["BS_HUB_KEY"]               # bshub_… (vit dans secrets.yaml du hub)
     ha_url = os.environ.get("HA_URL", "http://supervisor/core")
     ha_token = os.environ.get("HA_TOKEN") or os.environ.get("SUPERVISOR_TOKEN", "")
+    # ⚠️ DEUX JETONS, ET SURTOUT PAS LE MÊME.
+    #
+    # Celui du dessus est celui de L'AGENT : il passe par le Superviseur, qui
+    # l'accepte. Celui du dessous est celui de LA TABLETTE : elle attaque Home
+    # Assistant en direct, depuis le réseau de la maison, et Home Assistant
+    # n'accepte que ses propres jetons.
+    #
+    # Les confondre — ce qui était le cas — donnait une tablette qui affichait
+    # tout et ne commandait rien.
+    ha_token_pad = os.environ.get("BS_PAD_HA_TOKEN", "")
     config_dir = os.environ.get("HA_CONFIG_DIR", "/homeassistant")
     intervalle = int(os.environ.get("BS_SYNC_INTERVAL", "300"))
 
@@ -1862,8 +2007,18 @@ def main():
     # logement autonome. Un échec ici n'empêche pas le reste de tourner —
     # mieux vaut un hub qui entretient ses recettes sans servir la page qu'un
     # hub muet.
+    # Le dire au démarrage, en clair : sans ce jeton la tablette affichera son
+    # écran et aucun bouton ne marchera. C'est exactement la panne qu'on a mis
+    # une matinée à comprendre, faute d'une ligne dans le journal.
+    if not _jeton_pour_la_tablette(ha_token_pad):
+        print("[hub-agent] ⚠ aucun jeton Home Assistant pour la tablette "
+              "(option « ha_token » de l'add-on). La page sera servie, mais "
+              "elle ne pourra RIEN commander : elle affichera « hub non "
+              "connecté ». Créez un jeton de longue durée dans le profil "
+              "Home Assistant et collez-le dans les options de l'add-on.",
+              flush=True)
     try:
-        demarrer_serveur_pad(ha_url, ha_token)
+        demarrer_serveur_pad(ha_url, ha_token_pad)
     except Exception as e:
         print("[hub-agent] serveur de page KO :", e, flush=True)
 
