@@ -1,46 +1,25 @@
 # Brightstay Hub Agent
 
-Le programme qui relie ce logement à Brightstay.
+Relie le logement à Brightstay.
 
-## Ce qu'il fait
+Il appelle nos serveurs toutes les cinq minutes — jamais l'inverse, donc rien à
+configurer sur la box internet. Il remonte ce que voit le logement, applique ce
+qu'on lui demande, et sert la page de la tablette depuis le boîtier, y compris
+quand internet est coupé.
 
-**Il téléphone, on ne l'appelle jamais.** Toutes les cinq minutes, il appelle
-nos serveurs : voilà ce que je vois chez moi, avez-vous quelque chose pour moi ?
-C'est ce sens-là qui compte : un appel qui **part** de la maison traverse
-n'importe quelle box internet sans rien configurer, sans ouvrir de porte, sans
-adresse fixe.
-
-Concrètement, trois choses :
-
-- **il rapporte des faits** — température, ouvertures, détecteurs, état des
-  appareils, et sa propre santé ;
-- **il exécute** ce qu'on lui demande : installer une consigne, se mettre à
-  jour, prendre une sauvegarde, faire réagir un appareil ;
-- **il sert la page de la tablette** au mur, depuis le boîtier lui-même. C'est
-  ce qui fait que le logement continue de fonctionner quand internet tombe.
-
-## Ce qu'il ne fait pas
-
-Il ne transporte **ni image ni son** : il n'y a ni caméra ni micro dans le kit.
-Ce qui circule, ce sont des mesures et des ordres.
-
-Il ne décide de rien tout seul. Les règles vivent côté serveur ; lui applique.
+Ni caméra ni micro : ce qui circule, ce sont des mesures et des ordres.
 
 ## Réglage
 
-| Réglage | Défaut | À quoi ça sert |
+| | Défaut | |
 |---|---|---|
-| `sync_interval` | 300 | Secondes entre deux appels. Quand il a du travail, il enchaîne sans attendre. |
+| `sync_interval` | 300 | Secondes entre deux appels. Il enchaîne sans attendre quand il a du travail. |
 
-Les accès du boîtier (adresse du serveur, clé du logement) sont posés à
-l'atelier, dans la machine. Ils n'apparaissent pas ici et ne sont pas
-modifiables depuis l'écran : ce sont des secrets, pas des réglages.
+Les accès du boîtier sont posés à l'atelier, dans la machine. Ce sont des
+secrets, pas des réglages.
 
 ## Installation
 
-Cet add-on est installé en atelier, avant l'expédition. Il n'y a normalement
-rien à faire.
-
-## Support
+Faite en atelier avant l'expédition. Rien à faire.
 
 contact@brightstay.fr

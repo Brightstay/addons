@@ -1,9 +1,3 @@
-# Ce fichier est ce que Home Assistant lit EN PREMIER quand on ajoute cette
-# adresse dans une box. Il ne décrit pas un programme : il annonce qu'il y a
-# des programmes ici, et sous quel nom les afficher.
-#
-# Ce que le client voit dans sa box : « Brightstay », puis la liste des
-# add-ons — un dossier par add-on, chacun avec son propre config.yaml.
 name: Brightstay
 url: https://github.com/Brightstay/addons
 maintainer: Brightstay <contact@brightstay.fr>
