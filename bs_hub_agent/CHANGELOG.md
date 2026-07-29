@@ -1,5 +1,13 @@
 # Versions
 
+## 0.3.2
+
+- L'add-on se fabrique enfin : il manquait le fichier qui dit sur quelle base
+  le construire, et Python n'était pas installé dessus.
+- Icône et logo Brightstay dans la boutique.
+- Retrait des vieilles machines 32 bits (armv7), que Home Assistant ne
+  reconnaît plus.
+
 ## 0.3.1
 
 - L'adresse du serveur et la clé du logement peuvent être saisies dans l'écran
