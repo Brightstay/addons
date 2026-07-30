@@ -1,2 +1,5 @@
 __pycache__/
 *.pyc
+
+# Bruit macOS : ne dit rien d’utile et publie les noms de dossiers.
+.DS_Store

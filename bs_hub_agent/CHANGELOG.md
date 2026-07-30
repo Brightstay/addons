@@ -1,5 +1,14 @@
 # Versions
 
+## 0.4.1
+
+- La tablette reçoit désormais de quoi joindre Home Assistant même quand le
+  boîtier est installé derrière un réseau interne. Un nouveau réglage,
+  « ha_token », reçoit le jeton d'accès créé pour elle à l'atelier.
+- Le boîtier n'annonce plus d'accès qu'il sait inutilisables : il préfère dire
+  « non connecté » plutôt que laisser la tablette essayer sans fin, et il
+  l'écrit dans son journal au démarrage.
+
 ## 0.4.0
 
 - L'écran de la tablette n'est plus un bloc de 14 Mo mais des couches servies
