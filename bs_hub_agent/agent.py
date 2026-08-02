@@ -227,7 +227,7 @@ class Supervisor:
         infos = self._req("GET", "/addons/%s/info" % slug) or {}
         return infos.get("version_latest")
 
-    def maj_addon(self, slug="self", version=None):
+    def maj_addon(self, slug="self", version=None, ha=None):
         """Mettre l'add-on à jour.
 
         ⚠️ ON NE CHOISIT PAS LA VERSION. Éprouvé sur un vrai boîtier le 29/07 :
@@ -251,25 +251,43 @@ class Supervisor:
                 raise ValueError(
                     "la boutique propose %s, la fiche demande %s — le Superviseur "
                     "n'installe que ce que la boutique offre" % (offerte, version))
-        # ⛔ « self » NE MARCHE PAS ICI, ET LE 404 NE LE DIT PAS.
+        # ⛔ UN MODULE NE PEUT PAS SE REMPLACER LUI-MÊME. C'est une règle du
+        #    Superviseur, pas un bogue — lue dans son code le 02/08/2026 : le
+        #    rôle `manager` ouvre « /store/… », mais la règle « self » exclut
+        #    explicitement « update ».
         #
-        #    Éprouvé sur le vrai boîtier le 02/08/2026 : 26 tentatives en une
-        #    minute, toutes « HTTP Error 404: Not Found ».
+        #    Éprouvé sur le vrai boîtier, deux erreurs successives :
+        #      · POST /addons/self/update        → 404 (il cherche un module
+        #        littéralement nommé « self ») ;
+        #      · POST /addons/<vrai nom>/update  → 403 (le nom est bon, le
+        #        geste est interdit).
         #
-        #    Le Superviseur route `/addons/{x}/update` vers le gestionnaire de
-        #    la BOUTIQUE, qui cherche un add-on nommé littéralement « self » —
-        #    il n'en trouve aucun, donc 404. Le mot « self » n'est compris que
-        #    par l'autre gestionnaire, celui de `/addons/self/info`. D'où ce
-        #    piège : la même adresse marche en lecture et échoue en écriture.
-        #
-        #    On demande donc son vrai nom au boîtier avant d'agir.
+        #    Home Assistant, LUI, a le droit : c'est ce que fait le bouton
+        #    « Mettre à jour » de son interface. On lui demande donc d'agir à
+        #    notre place, avec ses droits. Sans ça, un agent défectueux ne peut
+        #    plus jamais être réparé à distance — et c'est exactement la
+        #    situation où l'on en a besoin.
         vrai = slug
         if slug == "self":
-            vrai = (self._req("GET", "/addons/self/info") or {}).get("slug")
+            fiche = self._req("GET", "/addons/self/info") or {}
+            vrai = fiche.get("slug")
             if not vrai:
                 raise ValueError(
-                    "le boîtier ne dit pas son propre nom d'add-on : "
-                    "impossible de le mettre à jour sans risquer de viser un autre")
+                    "le boîtier ne dit pas son propre nom de module : "
+                    "impossible de le mettre à jour sans risquer d'en viser un autre")
+            if ha is not None:
+                entite = entite_de_mise_a_jour(ha, fiche)
+                if entite:
+                    ha.call_service("update", "install", {"entity_id": entite})
+                    return {"addon": vrai, "par": entite,
+                            "version": version or "celle de la boutique"}
+                # Pas d'entité : on tente quand même la porte du Superviseur.
+                # Elle refusera pour nous-même, mais le message sera clair et
+                # l'échec dira POURQUOI, au lieu d'un 404 nu.
+                print("[hub-agent] aucune entité de mise à jour pour %s — "
+                      "on tente le Superviseur (il refusera si c'est nous-même)"
+                      % vrai, flush=True)
+
         self._req("POST", "/store/addons/%s/update" % vrai, {}, timeout=900)
         return {"addon": vrai, "version": version or "celle de la boutique"}
 
@@ -1815,7 +1833,7 @@ def dispatch(cmd, ha, store, sup=None, version_ha=None, differes=None):
         slug = p.get("slug") or "self"
         version = p.get("version")
         return _differer(differes, "addon.update:" + slug,
-                         lambda: sup.maj_addon(slug, version),
+                         lambda: sup.maj_addon(slug, version, ha),
                          "mise à jour de l'add-on %s vers %s" % (slug, version or "la version installée"),
                          cible={"version": version} if version else None)
 
@@ -2187,6 +2205,114 @@ def _empreintes_recettes(store):
     return {k: empreintes[k] for k in gardees}, True
 
 
+def _adresse_locale():
+    """L'adresse du boîtier SUR SON RÉSEAU, telle que lui la voit.
+
+    ⚠️ ÇA A COÛTÉ UNE APRÈS-MIDI. Le 02/08/2026, un boîtier a cessé d'appeler.
+    Impossible de le retrouver : `homeassistant.local` ne répond pas (le nom
+    dépend d'un service que tout pare-feu fait taire), son ancienne adresse
+    était périmée, et balayer le réseau n'a rien donné. On savait qu'il existait
+    et rien de plus.
+
+    Une machine qui appelle sait où elle est. Qu'elle le DISE, et on n'a plus
+    jamais à la chercher.
+
+    ⛔ Aucun paquet n'est envoyé : on ouvre une prise UDP vers une adresse
+    quelconque et on demande au système quelle interface il aurait choisie.
+    """
+    import socket
+    for cible in ("8.8.8.8", "1.1.1.1"):
+        s = None
+        try:
+            s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            s.settimeout(0.5)
+            s.connect((cible, 53))
+            ip = s.getsockname()[0]
+            if ip and not ip.startswith("127."):
+                return ip
+        except Exception:
+            pass
+        finally:
+            if s is not None:
+                try:
+                    s.close()
+                except Exception:
+                    pass
+    return None
+
+
+def _entites_de_mise_a_jour(ha):
+    """Ce que Home Assistant sait mettre à jour, et où il en est.
+
+    ⚠️ Sans cette liste, on DEVINE le nom d'une entité — et une entité inconnue
+    passée à Home Assistant est ignorée EN SILENCE. On croit avoir agi, il ne
+    se passe rien, et on cherche ailleurs. Trois noms essayés le 02/08, trois
+    fois « accepté », zéro effet.
+
+    On se limite à l'essentiel : l'identifiant, le titre, et les deux versions.
+    Rien de personnel, rien de secret.
+    """
+    try:
+        etats = ha.states() or []
+    except Exception:
+        return None
+    liste = []
+    for e in etats:
+        eid = str(e.get("entity_id") or "")
+        if not eid.startswith("update."):
+            continue
+        a = e.get("attributes") or {}
+        liste.append({
+            "id": eid,
+            "titre": str(a.get("title") or a.get("friendly_name") or "")[:60],
+            "installee": str(a.get("installed_version") or "")[:24],
+            "proposee": str(a.get("latest_version") or "")[:24],
+            "en_attente": e.get("state") == "on",
+        })
+        if len(liste) >= 30:
+            break
+    return liste
+
+
+def entite_de_mise_a_jour(ha, fiche):
+    """L'entité que Home Assistant expose pour mettre CE module à jour.
+
+    ⚠️ ON NE DEVINE PAS SON NOM, ON LE CHERCHE. Le 02/08/2026 j'ai essayé deux
+    noms plausibles depuis le serveur : Home Assistant les a acceptés en
+    silence — une entité inconnue dans une commande ne provoque aucune erreur —
+    et il ne s'est rien passé. Une heure perdue à croire que ça avait marché.
+
+    On lit donc la liste réelle et on compare au titre du module, que le
+    Superviseur nous a donné. Aucune supposition ne survit à une liste.
+    """
+    titre = str((fiche or {}).get("name") or "").strip().lower()
+    installee = str((fiche or {}).get("version") or "")
+    if not titre:
+        return None
+    try:
+        etats = ha.states() or []
+    except Exception as e:
+        print("[hub-agent] entités illisibles :", e, flush=True)
+        return None
+
+    replis = None
+    for e in etats:
+        eid = str(e.get("entity_id") or "")
+        if not eid.startswith("update."):
+            continue
+        a = e.get("attributes") or {}
+        # Le titre porté par l'entité est celui du module : c'est le lien sûr.
+        if str(a.get("title") or "").strip().lower() == titre:
+            return eid
+        # À défaut : le nom affiché commence par le titre du module, et la
+        # version installée concorde. Deux indices valent mieux qu'un.
+        nom = str(a.get("friendly_name") or "").strip().lower()
+        if nom.startswith(titre) and (
+                not installee or str(a.get("installed_version") or "") == installee):
+            replis = replis or eid
+    return replis
+
+
 def instantane_sante(ha, sup=None, store=None):
     """Ce que le hub VOIT, à chaque contact.
 
@@ -2316,6 +2442,30 @@ def instantane_sante(ha, sup=None, store=None):
     jours = _jours_certificat()
     if jours is not None:
         snap["certificat_jours"] = jours
+
+    # ⚠️ DEUX RENSEIGNEMENTS QUI ONT MANQUÉ LE 02/08/2026, ET CHACUN A COÛTÉ
+    #    DES HEURES.
+    #
+    #    · OÙ EST CETTE MACHINE. Quand elle s'est tue, impossible de la
+    #      retrouver : le nom `homeassistant.local` ne répond pas, son ancienne
+    #      adresse était périmée, et balayer le réseau n'a rien donné. Une
+    #      machine qui appelle sait où elle est — qu'elle le dise.
+    #    · CE QU'ELLE SAIT METTRE À JOUR. Sans la liste, on devine des noms
+    #      d'entités — et Home Assistant ignore EN SILENCE celles qui n'existent
+    #      pas. On croit avoir agi ; rien ne se passe.
+    try:
+        adresse = _adresse_locale()
+        if adresse:
+            snap["adresse_locale"] = adresse
+    except Exception as e:
+        snap["adresse_locale_erreur"] = str(e)[:120]
+
+    try:
+        maj = _entites_de_mise_a_jour(ha)
+        if maj is not None:
+            snap["entites_maj"] = maj
+    except Exception as e:
+        snap["entites_maj_erreur"] = str(e)[:120]
 
     return {"type": "sante", "severity": "info", "payload": snap,
             "occurred_at": _now_iso(),

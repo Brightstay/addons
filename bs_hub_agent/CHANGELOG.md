@@ -1,3 +1,20 @@
+## 0.5.2 — 2026-08-02
+
+**Un boîtier en panne peut enfin être réparé à distance.**
+
+- La mise à jour du module passe désormais par Home Assistant, qui en a le
+  droit — et non plus par le module lui-même, à qui c'est interdit. Jusqu'ici,
+  toute mise à jour demandée à distance échouait sur une erreur muette, et il
+  fallait se déplacer ou demander à l'hôte de cliquer. C'était vrai pour CHAQUE
+  correction, y compris celles qui réparaient une panne.
+- Le nom de l'entité de mise à jour est cherché, jamais deviné : Home Assistant
+  accepte en silence un nom qui n'existe pas, sans rien faire. Trois noms
+  plausibles ont été essayés le 02/08 ; les trois ont semblé réussir.
+- Le boîtier dit maintenant **son adresse sur son réseau** à chaque contact.
+  Quand il s'est tu ce jour-là, plus rien ne permettait de le retrouver.
+- Il énumère aussi ce que Home Assistant sait mettre à jour, avec les versions
+  installée et proposée — de quoi diagnostiquer sans y être.
+
 ## 0.5.1 — 2026-08-02
 
 **Le boîtier sait enfin se mettre à jour tout seul.**
