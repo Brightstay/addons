@@ -1,3 +1,20 @@
+## 0.5.0 — 2026-08-02
+
+**Le voyageur a toujours un écran, même le premier jour.**
+
+- Le boîtier emporte désormais l'écran Brightstay avec lui (logo et police
+  compris). Avant, un boîtier fraîchement installé servait une page d'erreur
+  jusqu'à ce qu'un paquet soit publié, déployé ET reçu — trois maillons, chacun
+  capable de manquer. Un filet qu'il faut télécharger n'est pas un filet.
+- L'écran du logement se met à jour par morceaux : corriger une ligne de la page
+  ne fait plus retélécharger les 14 Mo d'illustrations. Une expérience sur mesure
+  se pose par-dessus sans remplacer le reste, et ce qu'elle ne fournit pas
+  retombe sur la couche du dessous.
+- ⛔ Rien venu du serveur ne peut effacer cet écran de secours : un ordre de
+  déploiement qui le viserait est refusé. C'est le dernier recours du parc.
+- Les paquets sur mesure se téléchargent maintenant par une adresse signée,
+  valable une heure : ils ne sont plus lisibles par qui connaît leur nom.
+
 # Versions
 
 ## 0.4.1

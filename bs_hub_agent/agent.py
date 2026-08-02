@@ -18,8 +18,10 @@ Trois principes de robustesse :
 Stdlib uniquement (urllib) : aucune dépendance à installer.
 """
 import hashlib
+import hmac
 import json
 import os
+import threading
 import time
 import urllib.error
 import urllib.parse
@@ -330,7 +332,20 @@ PAD_GARDE = 3                            # versions conservées (pour revenir en
 # et continue de servir exactement la même chose. Il passe aux couches
 # l'une après l'autre, sans jour de bascule et sans écran noir.
 # ---------------------------------------------------------------------
-COUCHES = ("habillage", "illustrations", "page", "complet")
+# ⚠️ « socle » EST LE DERNIER RECOURS, ET IL EST EMBARQUÉ DANS L'ADD-ON.
+#
+# Un filet qu'il faut télécharger n'est pas un filet. Avant lui, un boîtier
+# fraîchement installé servait 404 jusqu'à ce qu'un paquet soit publié,
+# déployé ET reçu — trois choses qui peuvent manquer, et qui manquaient
+# précisément le jour où l'on en avait besoin. Le socle voyage donc AVEC
+# l'agent : dès que celui-ci démarre, le voyageur peut piloter la maison.
+#
+# Il ne se met à jour que par une version d'add-on, et c'est voulu : ce qui
+# rattrape les pannes ne doit pas dépendre de la même chaîne que ce qui tombe.
+COUCHES = ("habillage", "illustrations", "page", "complet", "socle")
+
+# Là où l'add-on range son socle, à côté de ce fichier.
+SOCLE_EMBARQUE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "socle")
 
 
 def _pad_chemins(couche="complet"):
@@ -340,6 +355,10 @@ def _pad_chemins(couche="complet"):
     rien à déménager."""
     if couche == "complet":
         return (os.path.join(PAD_RACINE, "versions"), os.path.join(PAD_RACINE, "courant"))
+    # Le socle n'a ni versions ni lien : il EST le dossier, livré avec l'agent.
+    # On ne le déploie pas, on ne le remplace pas, on ne le supprime pas.
+    if couche == "socle":
+        return (None, SOCLE_EMBARQUE)
     if couche not in COUCHES:
         raise ValueError("couche inconnue : " + str(couche))
     base = os.path.join(PAD_RACINE, "couches", couche)
@@ -464,6 +483,11 @@ def couches_servies():
     qui est en place (sinon on expédierait 40 Mo à l'aveugle)."""
     servies = {}
     for couche in COUCHES:
+        # On ne rend PAS compte du socle : le serveur déciderait de lui envoyer
+        # une version, alors qu'il n'y a rien à lui envoyer. Sa version est
+        # celle de l'add-on, et elle est déjà rapportée par ailleurs.
+        if couche == "socle":
+            continue
         try:
             v = version_pad_servie(couche)
         except Exception:
@@ -571,6 +595,13 @@ def deployer_pad(version, url, empreinte, couche="complet"):
     if not (version and url and empreinte):
         raise ValueError("version, url et empreinte sont tous obligatoires")
 
+    # ⛔ LE SOCLE NE SE DÉPLOIE PAS. Il vient avec l'add-on, et c'est ce qui en
+    # fait un filet : une commande du nuage ne doit pas pouvoir le remplacer,
+    # ni le vider. Le jour où quelqu'un enverrait « hub.pad.deploy » avec
+    # `couche: socle`, il emporterait le dernier recours du parc entier.
+    if couche == "socle":
+        raise ValueError("le socle est embarqué dans l'add-on : il ne se déploie pas")
+
     versions, courant = _pad_chemins(couche)
     os.makedirs(versions, exist_ok=True)
     cible = os.path.join(versions, str(version))
@@ -643,6 +674,9 @@ def _purger_versions(versions, courant):
 
 
 def versions_pad_disponibles(couche="complet"):
+    # Le socle n'a pas d'historique : il n'y a qu'une version, celle de l'agent.
+    if couche == "socle":
+        return []
     versions, _ = _pad_chemins(couche)
     if not os.path.isdir(versions):
         return []
@@ -886,7 +920,7 @@ def config_pour_la_tablette(url_ha, jeton_ha, adresse_locale, en_tete_host=None)
     return conf
 
 
-def demarrer_serveur_pad(ha_url=None, ha_token=None):
+def demarrer_serveur_pad(ha_url=None, ha_token=None, ha=None, sup=None):
     """Sert le dossier courant, en HTTPS si le hub a son certificat.
 
     Sans certificat, on sert quand même en clair — mais on le DIT : sans
@@ -917,7 +951,10 @@ def demarrer_serveur_pad(ha_url=None, ha_token=None):
             réseau), on la sait vivante même sous isolation, et si l'annonce
             arrive alors que le balayage échoue, on sait que c'est
             l'isolation — pas une tablette morte."""
-            if self.path.split("?")[0] != "/annonce":
+            route = self.path.split("?")[0]
+            if route == "/maintenance":
+                return self._maintenance()
+            if route != "/annonce":
                 self.send_response(404); self.end_headers(); return
             try:
                 n = int(self.headers.get("content-length") or 0)
@@ -939,6 +976,86 @@ def demarrer_serveur_pad(ha_url=None, ha_token=None):
             # l'adresse déjà connue — sinon le hub serait détourné vers un
             # inconnu à qui il enverrait le mot de passe de la tablette.
             self.send_response(204); self.end_headers()
+
+        def _repondre(self, code, objet):
+            corps = json.dumps(objet).encode()
+            self.send_response(code)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(corps)))
+            self.end_headers()
+            self.wfile.write(corps)
+
+        def _maintenance(self):
+            """REDÉMARRER HOME ASSISTANT DEPUIS LA TABLETTE.
+
+            Pourquoi ici et pas ailleurs : c'est le seul endroit que la tablette
+            sait déjà joindre. Sa page vient de ce serveur — même origine, rien
+            à ouvrir, aucun navigateur à convaincre. Et surtout : elle n'a pas
+            besoin du jeton de Home Assistant pour ça.
+
+            ⛔ LE CODE N'EST PAS DANS LA PAGE. Elle envoie ce que l'hôte a tapé,
+            le hub compare, et répond oui ou non. Un code servi à la tablette
+            serait lisible par tout le Wi-Fi du logement — donc pas un code.
+
+            ⛔ ET CE N'EST QUE `core.restart`. Redémarrer la MACHINE couperait
+            l'agent : plus aucun chemin de retour, et personne dans le logement
+            pour rebrancher. On ne met pas ça à portée d'un salon."""
+            try:
+                n = int(self.headers.get("content-length") or 0)
+                corps = json.loads(self.rfile.read(min(n, 2048)) or b"{}")
+                if not isinstance(corps, dict):
+                    corps = {}
+            except Exception:
+                corps = {}
+
+            # Sans Superviseur (essais, poste de développement), il n'y a rien
+            # à redémarrer : la porte n'existe pas plutôt que d'échouer plus tard.
+            attendu = _code_maintenance() if sup is not None else None
+            if not attendu:
+                # Fermé par défaut : sans code posé, aucune porte.
+                return self._repondre(403, {"ok": False, "raison": "indisponible"})
+
+            if _maintenance_verrouillee():
+                return self._repondre(429, {"ok": False, "raison": "trop d'essais"})
+
+            propose = str(corps.get("code") or "")
+            # Comparaison à durée constante : sans elle, le temps de réponse
+            # trahit le nombre de chiffres justes.
+            if not hmac.compare_digest(propose, str(attendu)):
+                _MAINTENANCE["essais"].append(time.time())
+                return self._repondre(403, {"ok": False, "raison": "code refusé"})
+
+            # Bon code : on repart d'une ardoise propre.
+            _MAINTENANCE["essais"] = []
+
+            depuis = time.time() - _MAINTENANCE["dernier_redemarrage"]
+            if depuis < MAINTENANCE_REPOS:
+                return self._repondre(429, {
+                    "ok": False,
+                    "raison": "déjà redémarré à l'instant",
+                    "attendre_s": int(MAINTENANCE_REPOS - depuis),
+                })
+
+            # Même garde que la commande venue du serveur : on ne coupe pas
+            # Home Assistant s'il ne saurait pas revenir.
+            try:
+                verdict = ha.check_config()
+            except Exception:
+                verdict = None
+            if isinstance(verdict, dict) and verdict.get("result") == "invalid":
+                return self._repondre(409, {"ok": False, "raison": "configuration invalide"})
+
+            _MAINTENANCE["dernier_redemarrage"] = time.time()
+            # ⚠️ La trace compte autant que le geste : un hôte qui redémarre
+            # cinq fois par jour n'est pas un hôte maladroit, c'est une panne
+            # qu'on ne voit pas encore.
+            try:
+                journal_evenement("maintenance", "info",
+                                  {"operation": "redemarrer", "origine": "tablette"})
+            except Exception:
+                pass
+            threading.Thread(target=sup.redemarrer_core, daemon=True).start()
+            return self._repondre(200, {"ok": True, "attendre_s": 60})
 
         def do_GET(self):
             # /config.json ne vient PAS du paquet : il est propre au logement
@@ -1124,14 +1241,33 @@ def _acces_chemin():
     return os.path.join(PAD_RACINE, "acces.json")
 
 
-def enregistrer_acces_pad(mot_de_passe, ip=None):
+def enregistrer_acces_pad(mot_de_passe, ip=None, code_maintenance=None):
+    """Les secrets du logement, rangés là où seul l'add-on les lit.
+
+    ⚠️ `code_maintenance` NE PASSE JAMAIS PAR `/config.json`. Ce fichier-là est
+    servi à qui le demande sur le Wi-Fi du logement : un code écrit dedans
+    serait un code affiché sur le mur. Il arrive donc par le canal des
+    secrets — le même que le mot de passe de la tablette — et c'est le HUB qui
+    vérifie, jamais la page. La tablette envoie ce qu'on a tapé et reçoit
+    oui ou non ; elle ne connaît pas la réponse."""
     if not mot_de_passe:
         raise ValueError("mot de passe vide")
     os.makedirs(PAD_RACINE, exist_ok=True)
     chemin = _acces_chemin()
+    # Un rappel du même mot de passe ne doit pas effacer le code déjà reçu.
+    ancien = {}
+    try:
+        with open(chemin, encoding="utf-8") as f:
+            ancien = json.load(f) or {}
+    except (OSError, ValueError):
+        ancien = {}
     tmp = chemin + ".tmp"
     with open(tmp, "w", encoding="utf-8") as f:
-        json.dump({"mot_de_passe": mot_de_passe, "ip": ip}, f)
+        json.dump({
+            "mot_de_passe": mot_de_passe,
+            "ip": ip,
+            "code_maintenance": code_maintenance or ancien.get("code_maintenance"),
+        }, f)
     os.replace(tmp, chemin)
     try:
         os.chmod(chemin, 0o600)      # lisible par l'add-on seul
@@ -1142,6 +1278,33 @@ def enregistrer_acces_pad(mot_de_passe, ip=None):
     # on ne renvoie JAMAIS le secret dans un accusé de réception : les
     # résultats de commande sont journalisés côté serveur.
     return {"acces": "enregistré"}
+
+
+def _code_maintenance():
+    """Le code que l'hôte tape sur la tablette. `None` = aucun, donc tout refusé."""
+    try:
+        with open(_acces_chemin(), encoding="utf-8") as f:
+            return (json.load(f) or {}).get("code_maintenance")
+    except (OSError, ValueError):
+        return None
+
+
+# Ce qui empêche d'essayer les codes un par un, et de boucler les redémarrages.
+_MAINTENANCE = {"essais": [], "dernier_redemarrage": 0.0}
+MAINTENANCE_ESSAIS_MAX = 5          # sur un quart d'heure
+MAINTENANCE_FENETRE = 900           # 15 min
+MAINTENANCE_REPOS = 600             # 10 min entre deux redémarrages
+
+
+def _maintenance_verrouillee(maintenant=None):
+    """Trop de codes faux récemment ? On ferme la porte un moment.
+
+    ⚠️ Six chiffres se devinent en un million d'essais — quelques heures pour
+    une machine sur le même Wi-Fi. Sans ce compteur, le code ne protégerait
+    rien."""
+    t = maintenant if maintenant is not None else time.time()
+    _MAINTENANCE["essais"] = [x for x in _MAINTENANCE["essais"] if t - x < MAINTENANCE_FENETRE]
+    return len(_MAINTENANCE["essais"]) >= MAINTENANCE_ESSAIS_MAX
 
 
 def _mdp_pad():
@@ -1645,6 +1808,28 @@ def dispatch(cmd, ha, store, sup=None, version_ha=None, differes=None):
                          "mise à jour de Home Assistant vers " + str(version))
 
     if t == "hub.core.restart":
+        # ⛔ ON REGARDE LA CONFIGURATION AVANT DE COUPER.
+        #
+        # Home Assistant relit tout au démarrage : une configuration invalide
+        # ne se voit pas tant qu'il tourne, et se paie au redémarrage — il ne
+        # revient pas. Le boîtier, lui, reste joignable (notre add-on et le
+        # Superviseur survivent), donc on peut encore réparer à distance ; mais
+        # entre-temps le logement n'a plus de domotique, et l'écran du voyageur
+        # n'a plus rien à afficher.
+        #
+        # Le contrôle existe et ne coûte rien : on refuse plutôt que d'éteindre.
+        # Si Home Assistant ne répond pas du tout, on redémarre quand même —
+        # c'est précisément le cas où le redémarrage est le remède.
+        verdict = None
+        try:
+            verdict = ha.check_config()
+        except Exception:
+            verdict = None
+        if isinstance(verdict, dict) and verdict.get("result") == "invalid":
+            return "failed", {
+                "error": "configuration invalide : Home Assistant ne redémarrerait pas",
+                "detail": str(verdict.get("errors") or "")[:400],
+            }
         return _differer(differes, "core.restart",
                          lambda: sup.redemarrer_core(), "redémarrage de Home Assistant")
 
@@ -1692,7 +1877,11 @@ def dispatch(cmd, ha, store, sup=None, version_ha=None, differes=None):
         # chercher le paquet et vérifie son empreinte avant tout déballage.
         # Sans couche : l'ancien paquet unique. Un boîtier d'avant reçoit donc
         # exactement ce qu'il recevait.
-        resultat = deployer_pad(p.get("version"), p.get("url"), p.get("sha256"),
+        # L'adresse se DEMANDE, elle ne se lit plus dans la commande : le seau
+        # est privé. En cas d'échec on retombe sur celle de la commande —
+        # c'est le chemin des boîtiers d'avant, et le filet pendant la bascule.
+        adresse = adresse_signee_du_paquet(p.get("version")) or p.get("url")
+        resultat = deployer_pad(p.get("version"), adresse, p.get("sha256"),
                                 p.get("couche") or "complet")
         # Déployer ne suffit pas : la tablette affiche toujours l'ancienne
         # page tant que personne ne la recharge (constaté au Raspberry).
@@ -1702,7 +1891,8 @@ def dispatch(cmd, ha, store, sup=None, version_ha=None, differes=None):
     if t == "hub.pad.identite":
         # Le serveur confie au hub de quoi parler à SA tablette. Envoyé une
         # fois, gardé ensuite — y compris après un remplacement de hub.
-        return "acked", enregistrer_acces_pad(p.get("mot_de_passe"), p.get("ip"))
+        return "acked", enregistrer_acces_pad(
+            p.get("mot_de_passe"), p.get("ip"), p.get("code_maintenance"))
 
     if t == "hub.pad.config":
         # Marque, nom, pièces, options : tout ce qui distingue un client d'un
@@ -1739,6 +1929,41 @@ def sync_once(hub_url, hub_key, events=None, acks=None, timeout=20):
     req.add_header("Content-Type", "application/json")
     with urllib.request.urlopen(req, timeout=timeout) as r:
         return json.loads(r.read().decode())
+
+
+def adresse_signee_du_paquet(version, timeout=20):
+    """La clé du boîtier échangée contre une adresse de téléchargement.
+
+    POURQUOI ON NE PREND PLUS L'ADRESSE DANS LA COMMANDE. Elle pointait sur un
+    seau public : n'importe qui la connaissant téléchargeait l'écran d'un
+    client, sa marque comprise. Le seau est privé désormais, et l'adresse se
+    demande — contre la clé de CE boîtier, qui ne donne accès qu'aux versions
+    que sa propre fiche nomme.
+
+    ⚠️ ON REND None PLUTÔT QUE DE LEVER. L'appelant retombe alors sur l'adresse
+    de la commande. C'est ce qui fait qu'un boîtier continue de se mettre à
+    jour pendant la transition, et qu'un incident sur cette fonction ne fige
+    pas le parc : au pire on repasse par l'ancien chemin.
+    """
+    base = os.environ.get("BS_HUB_SYNC_URL", "")
+    cle = os.environ.get("BS_HUB_KEY", "")
+    if not (base and cle and version):
+        return None
+    # Même projet, même racine : `…/functions/v1/hub-sync` → `…/functions/v1/paquet`.
+    url = base.rsplit("/", 1)[0] + "/paquet"
+    body = json.dumps({"version": version}).encode()
+    req = urllib.request.Request(url, data=body, method="POST")
+    req.add_header("x-hub-key", cle)
+    req.add_header("Content-Type", "application/json")
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as r:
+            rep = json.loads(r.read().decode())
+        return rep.get("url") or None
+    except Exception as e:
+        # On le DIT : un boîtier qui retombe silencieusement sur l'ancienne
+        # adresse donnerait l'illusion que le seau privé fonctionne.
+        print("[hub-agent] adresse de paquet non obtenue pour", version, ":", e, flush=True)
+        return None
 
 
 def traiter(commands, ha, store, sup=None, version_ha=None, differes=None):
@@ -2033,6 +2258,11 @@ def instantane_sante(ha, sup=None, store=None):
     try:
         # on dit si le hub PEUT parler à la tablette — jamais avec quoi
         snap["pad_acces"] = bool(_mdp_pad())
+        # ⚠️ Rapporté à part du mot de passe : sans ça, un code ajouté APRÈS
+        # coup ne serait jamais envoyé — le serveur ne réémet `hub.pad.identite`
+        # que tant qu'il croit le hub démuni, et le mot de passe suffisait à le
+        # rassurer.
+        snap["pad_maintenance"] = bool(_code_maintenance())
         pad = etat_pad()
         if pad is not None:
             snap["pad"] = pad
@@ -2084,6 +2314,20 @@ def _disque(host):
 def _sauvegardes(liste):
     dates = sorted([b.get("date") for b in liste if b.get("date")])
     return {"sauvegardes": len(liste), "derniere_sauvegarde": dates[-1] if dates else None}
+
+
+# Les événements produits par le serveur de la tablette : ils naissent dans un
+# autre fil que la boucle de synchronisation, qui les vide à son tour suivant.
+_EVENEMENTS_HORS_BOUCLE = []
+
+
+def journal_evenement(type_, severity, payload):
+    _EVENEMENTS_HORS_BOUCLE.append({
+        "type": type_, "severity": severity,
+        "payload": dict(payload or {}, agent_version=AGENT_VERSION),
+        "occurred_at": _now_iso(),
+        "dedup_key": "%s-%s" % (type_, _now_iso()),
+    })
 
 
 def _evt_maintenance(phase, quoi, detail=None):
@@ -2144,7 +2388,7 @@ def main():
               "Home Assistant et collez-le dans les options de l'add-on.",
               flush=True)
     try:
-        demarrer_serveur_pad(ha_url, ha_token_pad)
+        demarrer_serveur_pad(ha_url, ha_token_pad, ha=ha, sup=sup)
     except Exception as e:
         print("[hub-agent] serveur de page KO :", e, flush=True)
 
@@ -2194,6 +2438,10 @@ def main():
                 print("[hub-agent] instantané KO:", e, flush=True)
 
             differes = []
+            # Ce que le serveur de la tablette a signalé entre deux tours : il
+            # tourne dans un autre fil et ne peut pas parler au serveur lui-même.
+            while _EVENEMENTS_HORS_BOUCLE:
+                evenements.append(_EVENEMENTS_HORS_BOUCLE.pop(0))
             rep = sync_once(hub_url, hub_key, events=boot + evenements + sante, acks=acks)
             boot, evenements = [], []                 # le boot n'est envoyé qu'une fois
             commandes = en_retard + list(rep.get("commands", []))
