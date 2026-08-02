@@ -1,3 +1,9 @@
+## 0.5.10 — 2026-08-02
+
+Le relais cherche Home Assistant par les quatre portes possibles au lieu d'en
+supposer une. L'agent vit dans un conteneur isolé : il ne joint pas la machine
+par son adresse de réseau local, et sa porte de service n'a pas le même chemin.
+
 ## 0.5.9 — 2026-08-02
 
 Le relais joignait Home Assistant par la porte interne du module, où son

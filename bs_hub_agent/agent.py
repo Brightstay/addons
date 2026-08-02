@@ -1141,6 +1141,97 @@ def _ws_trame_texte(texte, masquer):
     return bytes(trame)
 
 
+def portes_vers_home_assistant(adresse_ha):
+    """Les adresses par lesquelles l'agent peut atteindre Home Assistant.
+
+    ⚠️ ON ESSAIE, ON NE SUPPOSE PAS. Le 03/08/2026, le relais visait l'adresse
+    du boîtier sur le réseau du logement : « connexion refusée ». L'agent vit
+    dans un conteneur isolé — il ne joint pas la machine par son adresse
+    publique. Et l'adresse qu'il utilise d'ordinaire, « http://supervisor/core »,
+    est une porte de service où le chemin « /api/websocket » n'existe pas.
+
+    Aucune de ces adresses n'est « la bonne » dans l'absolu : elle dépend de
+    l'installation. On les essaie donc dans l'ordre du plus probable au moins,
+    et on garde celle qui répond.
+    """
+    from urllib.parse import urlparse
+    portes = [
+        # Le nom que toute installation supervisée donne à Home Assistant.
+        ("http://homeassistant:8123", "/api/websocket"),
+        ("http://172.30.32.1:8123", "/api/websocket"),
+    ]
+    if adresse_ha:
+        u = urlparse(adresse_ha)
+        base = "%s://%s" % (u.scheme, u.netloc)
+        chemin = (u.path or "").rstrip("/")
+        # « http://supervisor/core » → la porte de service, dont le chemin
+        # d'écoute permanente est « /core/websocket » et non « /core/api/… ».
+        if chemin:
+            portes.append((base, chemin + "/websocket"))
+            portes.append((base, chemin + "/api/websocket"))
+        else:
+            portes.append((base, "/api/websocket"))
+    vues = set()
+    return [p for p in portes if not (p in vues or vues.add(p))]
+
+
+def _ouvrir_amont(adresse_ha):
+    """Ouvre l'écoute permanente vers Home Assistant. Rend (prise, octets_en_trop)."""
+    import base64
+    import socket as _sock
+    from urllib.parse import urlparse
+
+    dernier = None
+    for base, chemin in portes_vers_home_assistant(adresse_ha):
+        u = urlparse(base)
+        hote = u.hostname
+        port = u.port or (443 if u.scheme == "https" else 80)
+        amont = None
+        try:
+            amont = _sock.create_connection((hote, port), timeout=5)
+            if u.scheme == "https":
+                import ssl as _ssl
+                amont = _ssl.create_default_context().wrap_socket(amont, server_hostname=hote)
+            cle = base64.b64encode(os.urandom(16)).decode()
+            entetes = [
+                "GET %s HTTP/1.1" % chemin,
+                "Host: %s:%d" % (hote, port),
+                "Upgrade: websocket",
+                "Connection: Upgrade",
+                "Sec-WebSocket-Key: %s" % cle,
+                "Sec-WebSocket-Version: 13",
+            ]
+            # La porte de service exige le jeton du Superviseur ; Home Assistant
+            # l'ignore. Le poser toujours coûte moins qu'un cas particulier.
+            jeton_sup = os.environ.get("SUPERVISOR_TOKEN")
+            if jeton_sup:
+                entetes.append("Authorization: Bearer %s" % jeton_sup)
+            amont.sendall(("\r\n".join(entetes) + "\r\n\r\n").encode())
+
+            amont.settimeout(6)
+            tampon = b""
+            while b"\r\n\r\n" not in tampon:
+                bloc = amont.recv(4096)
+                if not bloc:
+                    raise OSError("raccroché pendant la poignée de main")
+                tampon += bloc
+            entete, reste = tampon.split(b"\r\n\r\n", 1)
+            if b"101" not in entete.split(b"\r\n")[0]:
+                raise OSError(entete.split(b"\r\n")[0].decode(errors="replace"))
+            amont.settimeout(None)
+            print("[hub-agent] relais : Home Assistant joint par %s%s" % (base, chemin),
+                  flush=True)
+            return amont, reste
+        except Exception as e:
+            dernier = "%s%s → %s" % (base, chemin, e)
+            if amont is not None:
+                try:
+                    amont.close()
+                except Exception:
+                    pass
+    raise OSError("aucune porte vers Home Assistant (dernière : %s)" % dernier)
+
+
 def _relayer_websocket(client, adresse_ha, jeton_reel, mdp_attendu, cle_client):
     """Relie la page à Home Assistant, en remplaçant le mot de passe par la clé.
 
@@ -1150,40 +1241,7 @@ def _relayer_websocket(client, adresse_ha, jeton_reel, mdp_attendu, cle_client):
     Home Assistant avec NOS droits d'administrateur — on aurait déplacé le
     trou, pas bouché.
     """
-    import socket as _sock
-    from urllib.parse import urlparse
-
-    u = urlparse(adresse_ha)
-    hote = u.hostname
-    port = u.port or (443 if u.scheme == "https" else 80)
-
-    amont = _sock.create_connection((hote, port), timeout=10)
-    if u.scheme == "https":
-        import ssl as _ssl
-        amont = _ssl.create_default_context().wrap_socket(amont, server_hostname=hote)
-
-    import base64
-    cle_nous = base64.b64encode(os.urandom(16)).decode()
-    amont.sendall((
-        "GET /api/websocket HTTP/1.1\r\n"
-        "Host: %s:%d\r\n"
-        "Upgrade: websocket\r\n"
-        "Connection: Upgrade\r\n"
-        "Sec-WebSocket-Key: %s\r\n"
-        "Sec-WebSocket-Version: 13\r\n\r\n" % (hote, port, cle_nous)
-    ).encode())
-
-    # On lit l'en-tête de la réponse, sans toucher aux octets qui suivent.
-    tampon = b""
-    while b"\r\n\r\n" not in tampon:
-        bloc = amont.recv(4096)
-        if not bloc:
-            raise OSError("Home Assistant a raccroché pendant la poignée de main")
-        tampon += bloc
-    entete, reste = tampon.split(b"\r\n\r\n", 1)
-    if b"101" not in entete.split(b"\r\n")[0]:
-        raise OSError("Home Assistant refuse la connexion : %s"
-                      % entete.split(b"\r\n")[0].decode(errors="replace"))
+    amont, reste = _ouvrir_amont(adresse_ha)
 
     client.sendall((
         "HTTP/1.1 101 Switching Protocols\r\n"
