@@ -311,6 +311,16 @@ class Supervisor:
     def info_host(self):
         return self._req("GET", "/host/info")
 
+    def info_reseau(self):
+        """Les interfaces réseau de la MACHINE, pas du conteneur.
+
+        ⚠️ CE DÉTOUR EST INDISPENSABLE. L'agent tourne dans un conteneur : lui
+        demander « quelle est ton adresse » rend `172.30.33.x`, le réseau
+        interne de Docker — inutilisable pour joindre le boîtier, et surtout
+        trompeur : on croit avoir la réponse. Seul le Superviseur voit les
+        vraies interfaces du système."""
+        return self._req("GET", "/network/info")
+
     def redemarrer_hote(self):
         self._req("POST", "/host/reboot", {}, timeout=60)
         return {"hote": "redémarrage demandé"}
@@ -2205,40 +2215,43 @@ def _empreintes_recettes(store):
     return {k: empreintes[k] for k in gardees}, True
 
 
-def _adresse_locale():
-    """L'adresse du boîtier SUR SON RÉSEAU, telle que lui la voit.
+def _adresse_locale(sup=None):
+    """L'adresse du boîtier SUR LE RÉSEAU DU LOGEMENT.
 
     ⚠️ ÇA A COÛTÉ UNE APRÈS-MIDI. Le 02/08/2026, un boîtier a cessé d'appeler.
     Impossible de le retrouver : `homeassistant.local` ne répond pas (le nom
     dépend d'un service que tout pare-feu fait taire), son ancienne adresse
     était périmée, et balayer le réseau n'a rien donné. On savait qu'il existait
-    et rien de plus.
+    et rien de plus. Une machine qui appelle sait où elle est : qu'elle le DISE.
 
-    Une machine qui appelle sait où elle est. Qu'elle le DISE, et on n'a plus
-    jamais à la chercher.
-
-    ⛔ Aucun paquet n'est envoyé : on ouvre une prise UDP vers une adresse
-    quelconque et on demande au système quelle interface il aurait choisie.
+    ⛔ ON DEMANDE AU SUPERVISEUR, PAS AU SYSTÈME. Première version de ce code :
+    une prise UDP pour lire l'interface choisie — elle a rendu `172.30.33.0`,
+    l'adresse du CONTENEUR. Techniquement juste, parfaitement inutile, et pire
+    que rien puisqu'elle a l'air d'une réponse. Le Superviseur, lui, voit les
+    interfaces de la machine.
     """
-    import socket
-    for cible in ("8.8.8.8", "1.1.1.1"):
-        s = None
-        try:
-            s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-            s.settimeout(0.5)
-            s.connect((cible, 53))
-            ip = s.getsockname()[0]
-            if ip and not ip.startswith("127."):
-                return ip
-        except Exception:
-            pass
-        finally:
-            if s is not None:
-                try:
-                    s.close()
-                except Exception:
-                    pass
-    return None
+    if sup is None:
+        return None
+    try:
+        infos = sup.info_reseau() or {}
+    except Exception:
+        return None
+    candidates = []
+    for i in (infos.get("interfaces") or []):
+        if not i.get("enabled"):
+            continue
+        adr = ((i.get("ipv4") or {}).get("address") or [])
+        for a in adr:
+            ip = str(a).split("/")[0]
+            if not ip or ip.startswith("127.") or ip.startswith("172.30."):
+                continue
+            # Une interface « primaire » est celle qui porte la route par
+            # défaut : c'est celle par laquelle on peut le joindre.
+            candidates.append((0 if i.get("primary") else 1, ip))
+    if not candidates:
+        return None
+    candidates.sort()
+    return candidates[0][1]
 
 
 def _entites_de_mise_a_jour(ha):
@@ -2454,7 +2467,7 @@ def instantane_sante(ha, sup=None, store=None):
     #      d'entités — et Home Assistant ignore EN SILENCE celles qui n'existent
     #      pas. On croit avoir agi ; rien ne se passe.
     try:
-        adresse = _adresse_locale()
+        adresse = _adresse_locale(sup)
         if adresse:
             snap["adresse_locale"] = adresse
     except Exception as e:

@@ -1,3 +1,12 @@
+## 0.5.3 — 2026-08-02
+
+**Le boîtier dit la bonne adresse.**
+
+- La 0.5.2 annonçait l'adresse de son conteneur (`172.30.x.x`) au lieu de celle
+  du logement : techniquement juste, inutilisable pour le joindre — et pire que
+  rien, puisqu'elle ressemblait à une réponse. Elle est maintenant demandée au
+  Superviseur, seul à voir les vraies interfaces de la machine.
+
 ## 0.5.2 — 2026-08-02
 
 **Un boîtier en panne peut enfin être réparé à distance.**
