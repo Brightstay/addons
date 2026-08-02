@@ -1,3 +1,14 @@
+## 0.5.4 — 2026-08-02
+
+**Le voyageur a enfin un écran : le serveur ne démarrait jamais.**
+
+- Le serveur qui sert la page du logement était lancé avant que le Superviseur
+  dont il dépend soit créé. Il plantait aussitôt, l'erreur était avalée, et
+  l'agent continuait comme si de rien n'était : le port 8099 ne répondait
+  simplement pas. Pas une mauvaise page, pas une page vide — rien.
+- L'erreur partait bien dans le journal de l'add-on… que personne ne lit. Elle
+  est maintenant criée, et l'écran de flotte la verra.
+
 ## 0.5.3 — 2026-08-02
 
 **Le boîtier dit la bonne adresse.**

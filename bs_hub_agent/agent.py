@@ -2577,16 +2577,37 @@ def main():
               "connecté ». Créez un jeton de longue durée dans le profil "
               "Home Assistant et collez-le dans les options de l'add-on.",
               flush=True)
-    try:
-        demarrer_serveur_pad(ha_url, ha_token_pad, ha=ha, sup=sup)
-    except Exception as e:
-        print("[hub-agent] serveur de page KO :", e, flush=True)
-
     jeton_sup = os.environ.get("SUPERVISOR_TOKEN")
     sup = Supervisor(jeton_sup, os.environ.get("BS_SUPERVISOR_URL", "http://supervisor")) \
         if jeton_sup else None
     if sup is None:
         print("[hub-agent] pas de Superviseur : entretien du hub indisponible", flush=True)
+
+    # ⛔ APRÈS `sup`, ET C'EST TOUT LE PROBLÈME.
+    #
+    #    Ce démarrage était placé QUINZE LIGNES PLUS HAUT, avant que `sup`
+    #    existe. Python levait donc « cannot access local variable 'sup' », le
+    #    `except` l'avalait poliment, et l'agent continuait comme si de rien
+    #    n'était. Résultat : le serveur de l'écran ne démarrait JAMAIS. Le
+    #    voyageur n'avait pas de page — pas une mauvaise page, pas une page
+    #    vide : rien du tout, le port 8099 ne répondait pas.
+    #
+    #    Le message « serveur de page KO » partait bien dans le journal de
+    #    l'add-on… que personne ne lit. Il est même passé sous mes yeux dans la
+    #    sortie des contrôles, et je ne l'ai pas relevé.
+    #
+    #    ⚠️ NE JAMAIS REMONTER CET APPEL. Il a besoin du Superviseur pour servir
+    #    le socle embarqué et rendre compte des couches.
+    try:
+        demarrer_serveur_pad(ha_url, ha_token_pad, ha=ha, sup=sup)
+    except Exception as e:
+        # Un écran mort est ce que le voyageur voit EN PREMIER : on le crie.
+        print("[hub-agent] ⛔ SERVEUR DE PAGE KO — le voyageur n'aura AUCUN "
+              "écran :", e, flush=True)
+        # ⚠️ Pas d'événement ici : le journal des événements n'existe pas encore
+        #    à cet instant. Le référencer aurait reproduit MOT POUR MOT le
+        #    défaut qu'on corrige — un nom utilisé avant d'exister, avalé par un
+        #    `except`. L'état est rapporté au premier instantané de santé.
 
     # Un seul numéro de version pour l'agent : celui de l'add-on installé. Le
     # Superviseur le connaît, on le lui demande plutôt que d'entretenir à la
