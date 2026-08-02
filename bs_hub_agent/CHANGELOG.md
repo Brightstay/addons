@@ -1,3 +1,10 @@
+## 0.5.8 — 2026-08-02
+
+Rien de neuf pour un hôte : la 0.5.7 a été publiée avec huit contrôles au
+rouge — des contrôles qui affirmaient l'ancien fonctionnement, celui où la clé
+partait dans la tablette. Ils disent maintenant la bonne chose, et l'un d'eux
+vérifie explicitement que cette clé n'apparaît nulle part.
+
 ## 0.5.7 — 2026-08-02
 
 **La clé de la domotique ne quitte plus le boîtier.**
