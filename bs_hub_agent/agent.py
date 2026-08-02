@@ -973,6 +973,31 @@ def _jeton_pour_la_tablette(jeton):
     return jeton.strip()
 
 
+def _adresse_du_relais(adresse_locale, en_tete_host):
+    """Le boîtier, vu par la tablette qui vient de l'appeler.
+
+    ⚠️ ON REPART DE L'EN-TÊTE `Host`, c'est-à-dire de l'adresse que la tablette
+    a RÉELLEMENT composée. Fabriquer l'adresse nous-mêmes, c'est se tromper le
+    jour où le boîtier a deux cartes réseau, ou une adresse qui a changé — et
+    la tablette se connecterait à une machine injoignable en affichant « hub
+    non connecté », sans que personne comprenne pourquoi.
+    """
+    hote = (en_tete_host or "").strip()
+    if not hote:
+        if not adresse_locale:
+            return None
+        hote = "%s:%d" % (adresse_locale, PAD_WEB_PORT)
+    # ⚠️ MÊME RÈGLE QUE LE SERVEUR, pas une seconde règle. Le serveur ne passe
+    #    en HTTPS que s'il a bien ses deux fichiers de certificat sur le disque
+    #    (voir `demarrer_serveur_pad`). Deviner ici indépendamment, c'est
+    #    annoncer une adresse en « https » sur un serveur en clair — la
+    #    tablette ne se connecterait jamais, sans dire pourquoi.
+    cert, cle = os.environ.get("BS_PAD_CERT"), os.environ.get("BS_PAD_CLE")
+    chiffre = bool(cert and cle and os.path.exists(cert) and os.path.exists(cle))
+    schema = "https" if chiffre else "http"
+    return "%s://%s" % (schema, hote)
+
+
 def config_pour_la_tablette(url_ha, jeton_ha, adresse_locale, en_tete_host=None):
     """La configuration du logement + de quoi joindre Home Assistant."""
     try:
@@ -992,11 +1017,24 @@ def config_pour_la_tablette(url_ha, jeton_ha, adresse_locale, en_tete_host=None)
     # Les deux ensemble, ou aucun des deux : une adresse sans jeton, ou un
     # jeton sans adresse, laisse la tablette essayer sans fin. Et un jeton que
     # Home Assistant refusera ne vaut pas mieux que pas de jeton du tout.
-    adresse = _adresse_joignable(url_ha, adresse_locale, en_tete_host)
+    # ⛔ ON N'ENVOIE PLUS LA CLÉ DE HOME ASSISTANT À LA TABLETTE.
+    #
+    #    Avant : `ha_url` désignait Home Assistant et `ha_token` était une clé
+    #    d'ADMINISTRATEUR valable dix ans. Ce fichier étant servi sans mot de
+    #    passe sur le réseau du logement, quiconque avait le Wi-Fi la lisait.
+    #
+    #    Maintenant : `ha_url` désigne LE BOÎTIER lui-même, et `ha_token` est un
+    #    mot de passe tiré au démarrage qui n'ouvre que le relais de CE boîtier.
+    #    Le lire ne permet que ce que la tablette fait déjà — allumer une lampe
+    #    dans ce logement — au lieu d'ouvrir toute la domotique.
+    #
+    #    ⚠️ On n'annonce le relais que si l'on a VRAIMENT une clé à relayer :
+    #    sinon la page se connecterait pour se faire refuser, en boucle.
     jeton = _jeton_pour_la_tablette(jeton_ha)
-    if adresse and jeton:
-        conf["ha_url"] = adresse
-        conf["ha_token"] = jeton
+    moi = _adresse_du_relais(adresse_locale, en_tete_host)
+    if moi and jeton:
+        conf["ha_url"] = moi
+        conf["ha_token"] = mot_de_passe_relais()
 
     # ⛔ CE QUE LA TABLETTE NE DOIT JAMAIS AFFICHER. La page lit Home Assistant
     #    directement : filtrer côté inventaire ne la protège pas. On lui donne
@@ -1007,9 +1045,227 @@ def config_pour_la_tablette(url_ha, jeton_ha, adresse_locale, en_tete_host=None)
     return conf
 
 
+# =====================================================================
+# LE RELAIS VERS HOME ASSISTANT — pour que la clé ne quitte plus le boîtier.
+#
+# ⛔ LE DÉFAUT QU'IL SUPPRIME. Jusqu'ici, `/config.json` livrait à la tablette
+#    une clé d'ADMINISTRATEUR Home Assistant valable dix ans, sur un port
+#    ouvert à tout le réseau du logement. N'importe qui ayant le mot de passe
+#    du Wi-Fi — un voyageur, son invité, un voisin qui l'a eu une fois — la
+#    lisait en une requête, et pilotait ensuite la domotique : ouvrir ce qui
+#    s'ouvre, lire l'historique de présence, éteindre les détecteurs.
+#
+#    Ce n'était pas un compromis pesé : personne ne l'avait décidé.
+#
+# CE QU'ON FAIT. La page ne parle plus à Home Assistant : elle parle au
+# boîtier, sur le port qui lui sert déjà sa page. Le boîtier relaie, et
+# remplace au passage le mot de passe de la page par la vraie clé — qui ne
+# sort jamais de la machine.
+#
+# ⚠️ POURQUOI UN RELAIS ET PAS UNE AUTORISATION. On aurait pu autoriser la page
+#    à parler directement à Home Assistant. Ça n'aurait rien réglé : la clé
+#    serait restée dans la tablette. Le relais est ce qui la retire.
+#
+# ⚠️ LE MOT DE PASSE DE LA PAGE EST TIRÉ AU HASARD À CHAQUE DÉMARRAGE. Il ne
+#    vaut que pour ce boîtier et ne donne accès à rien d'autre. Le lire ne
+#    permet que ce que la tablette fait déjà : allumer une lampe dans CE
+#    logement. C'est la différence entre une clé de chambre et le passe-partout.
+# =====================================================================
+CLE_WS = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"   # constante du protocole
+
+# Tiré au démarrage. Jamais écrit sur disque : un redémarrage le renouvelle,
+# et la tablette le relit dans `/config.json`.
+_MDP_RELAIS = None
+
+
+def mot_de_passe_relais():
+    global _MDP_RELAIS
+    if _MDP_RELAIS is None:
+        _MDP_RELAIS = "relais_" + hashlib.sha256(os.urandom(32)).hexdigest()[:32]
+    return _MDP_RELAIS
+
+
+def _ws_accept(cle_client):
+    """La réponse que le protocole exige : sans elle, aucun navigateur ne suit."""
+    import base64
+    brut = hashlib.sha1((cle_client + CLE_WS).encode()).digest()
+    return base64.b64encode(brut).decode()
+
+
+def _ws_lire_trame(lire):
+    """Une trame, décodée. Rend (opcode, contenu, trame_brute) ou None si fini.
+
+    ⚠️ ON GARDE LA TRAME BRUTE. Tout ce qui n'est pas le message
+    d'authentification est retransmis TEL QUEL : ne pas ré-encoder, c'est ne
+    pas pouvoir se tromper sur la fragmentation, les pings, ou le binaire.
+    """
+    entete = lire(2)
+    if len(entete) < 2:
+        return None
+    brut = bytearray(entete)
+    opcode = entete[0] & 0x0F
+    masque = bool(entete[1] & 0x80)
+    taille = entete[1] & 0x7F
+    if taille == 126:
+        ext = lire(2); brut += ext; taille = int.from_bytes(ext, "big")
+    elif taille == 127:
+        ext = lire(8); brut += ext; taille = int.from_bytes(ext, "big")
+    cle = b""
+    if masque:
+        cle = lire(4); brut += cle
+    contenu = lire(taille) if taille else b""
+    brut += contenu
+    if masque and contenu:
+        contenu = bytes(o ^ cle[i % 4] for i, o in enumerate(contenu))
+    return opcode, contenu, bytes(brut)
+
+
+def _ws_trame_texte(texte, masquer):
+    """Une trame texte. `masquer` : vrai quand on parle EN TANT QUE client."""
+    charge = texte.encode("utf-8")
+    trame = bytearray([0x81])
+    n = len(charge)
+    bit = 0x80 if masquer else 0x00
+    if n < 126:
+        trame.append(bit | n)
+    elif n < 65536:
+        trame.append(bit | 126); trame += n.to_bytes(2, "big")
+    else:
+        trame.append(bit | 127); trame += n.to_bytes(8, "big")
+    if masquer:
+        cle = os.urandom(4)
+        trame += cle
+        trame += bytes(o ^ cle[i % 4] for i, o in enumerate(charge))
+    else:
+        trame += charge
+    return bytes(trame)
+
+
+def _relayer_websocket(client, adresse_ha, jeton_reel, mdp_attendu, cle_client):
+    """Relie la page à Home Assistant, en remplaçant le mot de passe par la clé.
+
+    ⛔ CE QUI EST VÉRIFIÉ ICI, ET NULLE PART AILLEURS : le message
+    d'authentification de la page DOIT porter le mot de passe du relais. Sans
+    ce contrôle, n'importe qui sur le réseau du logement se ferait relayer vers
+    Home Assistant avec NOS droits d'administrateur — on aurait déplacé le
+    trou, pas bouché.
+    """
+    import socket as _sock
+    from urllib.parse import urlparse
+
+    u = urlparse(adresse_ha)
+    hote = u.hostname
+    port = u.port or (443 if u.scheme == "https" else 80)
+
+    amont = _sock.create_connection((hote, port), timeout=10)
+    if u.scheme == "https":
+        import ssl as _ssl
+        amont = _ssl.create_default_context().wrap_socket(amont, server_hostname=hote)
+
+    import base64
+    cle_nous = base64.b64encode(os.urandom(16)).decode()
+    amont.sendall((
+        "GET /api/websocket HTTP/1.1\r\n"
+        "Host: %s:%d\r\n"
+        "Upgrade: websocket\r\n"
+        "Connection: Upgrade\r\n"
+        "Sec-WebSocket-Key: %s\r\n"
+        "Sec-WebSocket-Version: 13\r\n\r\n" % (hote, port, cle_nous)
+    ).encode())
+
+    # On lit l'en-tête de la réponse, sans toucher aux octets qui suivent.
+    tampon = b""
+    while b"\r\n\r\n" not in tampon:
+        bloc = amont.recv(4096)
+        if not bloc:
+            raise OSError("Home Assistant a raccroché pendant la poignée de main")
+        tampon += bloc
+    entete, reste = tampon.split(b"\r\n\r\n", 1)
+    if b"101" not in entete.split(b"\r\n")[0]:
+        raise OSError("Home Assistant refuse la connexion : %s"
+                      % entete.split(b"\r\n")[0].decode(errors="replace"))
+
+    client.sendall((
+        "HTTP/1.1 101 Switching Protocols\r\n"
+        "Upgrade: websocket\r\n"
+        "Connection: Upgrade\r\n"
+        "Sec-WebSocket-Accept: %s\r\n\r\n" % _ws_accept(cle_client)
+    ).encode())
+
+    en_attente = {"amont": bytearray(reste)}
+
+    def lire_de(sock, cle_tampon):
+        def _lire(n):
+            t = en_attente.setdefault(cle_tampon, bytearray())
+            while len(t) < n:
+                bloc = sock.recv(65536)
+                if not bloc:
+                    return bytes(t[:n]) if n <= len(t) else b""
+                t += bloc
+            out = bytes(t[:n]); del t[:n]
+            return out
+        return _lire
+
+    lire_amont = lire_de(amont, "amont")
+    lire_client = lire_de(client, "client")
+
+    # 1. Home Assistant demande l'authentification : on transmet tel quel.
+    t = _ws_lire_trame(lire_amont)
+    if t is None:
+        raise OSError("Home Assistant n'a rien dit")
+    client.sendall(t[2])
+
+    # 2. La page répond. C'est LA trame qu'on remplace.
+    t = _ws_lire_trame(lire_client)
+    if t is None:
+        raise OSError("la page a raccroché")
+    autorise = False
+    try:
+        msg = json.loads(t[1].decode("utf-8"))
+        autorise = (msg.get("type") == "auth"
+                    and hmac.compare_digest(str(msg.get("access_token") or ""), mdp_attendu))
+    except Exception:
+        autorise = False
+    if not autorise:
+        # ⛔ On refuse comme Home Assistant refuserait : la page réessaiera et
+        #    dira « accès refusé », au lieu de rester figée sans explication.
+        client.sendall(_ws_trame_texte(json.dumps(
+            {"type": "auth_invalid", "message": "mot de passe du relais invalide"}), False))
+        try:
+            amont.close()
+        except Exception:
+            pass
+        return
+    amont.sendall(_ws_trame_texte(json.dumps(
+        {"type": "auth", "access_token": jeton_reel}), True))
+
+    # 3. Le reste passe en aveugle, dans les deux sens.
+    import select
+    socks = [client, amont]
+    try:
+        while True:
+            prets, _, _ = select.select(socks, [], [], 300)
+            if not prets:
+                break
+            for s in prets:
+                autre = amont if s is client else client
+                cle_t = "client" if s is client else "amont"
+                t = en_attente.get(cle_t)
+                if t:
+                    autre.sendall(bytes(t)); del t[:]
+                bloc = s.recv(65536)
+                if not bloc:
+                    return
+                autre.sendall(bloc)
+    finally:
+        for s in socks:
+            try:
+                s.close()
+            except Exception:
+                pass
+
+
 def demarrer_serveur_pad(ha_url=None, ha_token=None, ha=None, sup=None):
-    global _SUP_POUR_CONFIG
-    _SUP_POUR_CONFIG = sup
     """Sert le dossier courant, en HTTPS si le hub a son certificat.
 
     Sans certificat, on sert quand même en clair — mais on le DIT : sans
@@ -1018,6 +1274,11 @@ def demarrer_serveur_pad(ha_url=None, ha_token=None, ha=None, sup=None):
     import functools
     import threading
     from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
+
+    # `config_pour_la_tablette` est appelée depuis le serveur web, qui n'a pas
+    # le Superviseur sous la main : on le lui laisse ici.
+    global _SUP_POUR_CONFIG
+    _SUP_POUR_CONFIG = sup
 
     versions, courant = _pad_chemins()
     os.makedirs(versions, exist_ok=True)
@@ -1147,6 +1408,27 @@ def demarrer_serveur_pad(ha_url=None, ha_token=None, ha=None, sup=None):
             return self._repondre(200, {"ok": True, "attendre_s": 60})
 
         def do_GET(self):
+            # ⛔ LE RELAIS VERS HOME ASSISTANT. C'est ici que la clé
+            #    d'administrateur cesse de quitter le boîtier : la page se
+            #    connecte à NOUS, pas à Home Assistant, et nous remplaçons son
+            #    mot de passe par la vraie clé.
+            if (self.path.split("?")[0] == "/api/websocket"
+                    and "websocket" in (self.headers.get("Upgrade") or "").lower()):
+                cible = _adresse_joignable(ha_url, None, None) or ha_url
+                jeton = _jeton_pour_la_tablette(ha_token)
+                if not (cible and jeton):
+                    self.send_response(503); self.end_headers(); return
+                try:
+                    _relayer_websocket(self.connection, cible, jeton,
+                                       mot_de_passe_relais(),
+                                       self.headers.get("Sec-WebSocket-Key") or "")
+                except Exception as e:
+                    print("[hub-agent] relais interrompu :", e, flush=True)
+                # La prise appartient au relais : on ne rend pas la main à
+                # l'HTTP, qui écrirait par-dessus une connexion déjà détournée.
+                self.close_connection = True
+                return
+
             # /config.json ne vient PAS du paquet : il est propre au logement
             # et doit survivre à chaque mise à jour de l'interface.
             if self.path.split("?")[0] == "/config.json":

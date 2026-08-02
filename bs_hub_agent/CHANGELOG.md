@@ -1,3 +1,16 @@
+## 0.5.7 — 2026-08-02
+
+**La clé de la domotique ne quitte plus le boîtier.**
+
+- Jusqu'ici, le boîtier livrait à la tablette une clé d'administrateur Home
+  Assistant valable dix ans, sur un port ouvert à tout le réseau du logement.
+  N'importe qui ayant le mot de passe du Wi-Fi — un voyageur, son invité, un
+  voisin qui l'a eu une fois — pouvait la lire et piloter la domotique : ouvrir
+  ce qui s'ouvre, lire l'historique de présence, éteindre les détecteurs.
+- La tablette ne parle plus à Home Assistant : elle parle au boîtier, qui
+  relaie. La clé reste sur la machine. Ce que la tablette reçoit désormais
+  n'ouvre que ce boîtier-là, et se renouvelle à chaque démarrage.
+
 ## 0.5.6 — 2026-08-02
 
 **Le voyageur ne peut plus éteindre le boîtier depuis son canapé.**
