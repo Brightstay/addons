@@ -3300,6 +3300,20 @@ async function buildFromHA(conn){
     if (!KEEP_DOMAINS.includes(domain)) continue;
     const r = reg[s.entity_id];
     if (r && (r.disabled_by || r.hidden_by || r.entity_category)) continue;
+    /* ⛔ NOS PROPRES MODULES NE SONT PAS DES APPAREILS DU LOGEMENT.
+       Home Assistant crée un interrupteur par module installé — dont le nôtre.
+       Vérifié sur un boîtier réel le 02/08/2026 : `switch.brightstay_hub_agent`
+       ne porte AUCUNE marque (ni cachée, ni « réglage »), il passait donc le
+       filtre du dessus et se serait affiché au mur, à côté des lampes. Un
+       voyageur l'éteint depuis son canapé : plus d'agent, donc plus de
+       surveillance ni de réparation à distance.
+       La plateforme `hassio` est le signal sûr : elle vaut pour tous les
+       modules, y compris ceux qu'on ajoutera. */
+    if (r && r.platform === 'hassio') continue;
+    /* Repli quand le registre est illisible (jeton non administrateur) : le
+       boîtier nous a dit lui-même ce qu'il faut écarter. */
+    if (CFG_HUB && Array.isArray(CFG_HUB.exclure)
+        && CFG_HUB.exclure.indexOf(s.entity_id) !== -1) continue;
     const dc = (s.attributes || {}).device_class;
     if (domain === 'sensor' && dc !== 'temperature' && dc !== 'humidity') continue;
     /* ⚠️ LE RANGEMENT VIENT DE L'INTERFACE BRIGHTSTAY, PAS DE HOME ASSISTANT.

@@ -1,3 +1,16 @@
+## 0.5.6 — 2026-08-02
+
+**Le voyageur ne peut plus éteindre le boîtier depuis son canapé.**
+
+- Home Assistant crée un interrupteur pour chaque module installé, dont le
+  nôtre. Aucun ne portait de marque particulière : ils se seraient affichés sur
+  la tablette murale à côté des lampes. Un voyageur qui coupe « Brightstay Hub
+  Agent » coupait la surveillance, les mises à jour et toute réparation à
+  distance — sans mauvaise intention.
+- Ils sont maintenant écartés partout : dans l'inventaire du logement et sur
+  l'écran du voyageur. Un module ajouté plus tard le sera aussi, sans rien
+  toucher.
+
 ## 0.5.5 — 2026-08-02
 
 **La mise à jour à distance passe enfin, pour de bon.**

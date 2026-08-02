@@ -793,7 +793,12 @@ def revenir_pad(version=None, couche="complet"):
 # aucune raison de connaître la clé de la maison, et ne doit pas pouvoir
 # l'inventer.
 # =====================================================================
-ACCES_RESERVES = ("ha_url", "ha_token")
+ACCES_RESERVES = ("ha_url", "ha_token", "exclure")
+
+# Le Superviseur, posé au démarrage : `config_pour_la_tablette` en a besoin
+# pour savoir quels interrupteurs sont les nôtres, et elle est appelée depuis
+# le serveur web, qui n'y a pas accès autrement.
+_SUP_POUR_CONFIG = None
 
 # =====================================================================
 # L'ADRESSE DU HUB NE DOIT PAS ÊTRE ÉCRITE DANS LA FICHE.
@@ -992,10 +997,19 @@ def config_pour_la_tablette(url_ha, jeton_ha, adresse_locale, en_tete_host=None)
     if adresse and jeton:
         conf["ha_url"] = adresse
         conf["ha_token"] = jeton
+
+    # ⛔ CE QUE LA TABLETTE NE DOIT JAMAIS AFFICHER. La page lit Home Assistant
+    #    directement : filtrer côté inventaire ne la protège pas. On lui donne
+    #    donc la liste, calculée ici, où le Superviseur est connu.
+    interdits = sorted(entites_de_nos_modules(_SUP_POUR_CONFIG))
+    if interdits:
+        conf["exclure"] = interdits
     return conf
 
 
 def demarrer_serveur_pad(ha_url=None, ha_token=None, ha=None, sup=None):
+    global _SUP_POUR_CONFIG
+    _SUP_POUR_CONFIG = sup
     """Sert le dossier courant, en HTTPS si le hub a son certificat.
 
     Sans certificat, on sert quand même en clair — mais on le DIT : sans
@@ -1851,7 +1865,7 @@ def dispatch(cmd, ha, store, sup=None, version_ha=None, differes=None):
         pret, raison = ha_pret(ha)
         if not pret:
             return "failed", {"error": raison}
-        return "acked", inventaire(ha)
+        return "acked", inventaire(ha, sup)
 
     # -----------------------------------------------------------------
     # ENTRETIEN DE LA MACHINE — tout ce qui suit passe par le Superviseur.
@@ -2107,13 +2121,63 @@ def ha_pret(ha):
     return True, None
 
 
-def inventaire(ha):
+def _slug_ha(nom):
+    """Le nom d'entité que Home Assistant fabrique à partir d'un libellé.
+
+    « Brightstay Hub Agent » → « brightstay_hub_agent ». C'est la règle de Home
+    Assistant : minuscules, tout ce qui n'est ni lettre ni chiffre devient un
+    tiret bas, pas de doublons ni de bords."""
+    out = []
+    for c in str(nom or "").lower():
+        out.append(c if (c.isalnum() and ord(c) < 128) else "_")
+    return "_".join(x for x in "".join(out).split("_") if x)
+
+
+def entites_de_nos_modules(sup):
+    """Les interrupteurs que Home Assistant crée pour NOS PROPRES modules.
+
+    ⛔ ILS N'ONT RIEN À FAIRE SUR LA TABLETTE DU VOYAGEUR. Home Assistant crée
+    un interrupteur par module installé — dont le nôtre. Rangé dans une pièce,
+    il s'afficherait au mur comme « Brightstay Hub Agent », à côté des lampes.
+    Un voyageur curieux l'éteint : plus d'agent, donc plus de surveillance,
+    plus de mise à jour, plus de réparation à distance. Depuis son canapé, et
+    sans mauvaise intention.
+
+    Constaté le 02/08/2026 sur un boîtier réel : `switch.brightstay_hub_agent`
+    et `switch.matter_server` remontaient comme des appareils du logement.
+
+    On les nomme à partir de la liste du Superviseur plutôt que d'une liste
+    écrite à la main : un module ajouté demain sera écarté sans qu'on y pense.
+    """
+    if sup is None:
+        return set()
+    try:
+        liste = (sup.info_addons() or {}).get("addons", []) or []
+    except Exception:
+        return set()
+    interdits = set()
+    for a in liste:
+        for base in (a.get("name"), a.get("slug")):
+            slug = _slug_ha(base)
+            if not slug:
+                continue
+            # Home Assistant expose un interrupteur, et parfois une mise à jour.
+            interdits.add("switch." + slug)
+            interdits.add("update." + slug + "_update")
+    return interdits
+
+
+def inventaire(ha, sup=None):
     """Ce que le hub voit, compacté pour l'écran de configuration."""
     etats = ha.states() or []
     appareils = []
+    # Nos propres modules ne sont pas des appareils du logement.
+    nous = entites_de_nos_modules(sup)
 
     for e in etats:
         eid = e.get("entity_id") or ""
+        if eid in nous:
+            continue
         domaine = eid.split(".")[0] if "." in eid else ""
         attrs = e.get("attributes") or {}
         classe = attrs.get("device_class")
