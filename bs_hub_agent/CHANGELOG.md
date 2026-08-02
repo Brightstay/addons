@@ -1,6 +1,17 @@
 ## 0.5.1 — 2026-08-02
 
-- À DÉCRIRE : ce que cette version change pour un hôte.
+**Le boîtier sait enfin se mettre à jour tout seul.**
+
+- Jusqu'ici, une mise à jour demandée à distance échouait TOUJOURS, sur une
+  erreur muette (« 404 »). L'agent demandait à Home Assistant de mettre à jour
+  « self » — un raccourci que Home Assistant comprend pour lire des
+  informations, mais pas pour installer. Il cherchait alors un module
+  littéralement appelé « self », n'en trouvait aucun, et abandonnait sans rien
+  expliquer. L'agent demande maintenant son vrai nom au boîtier avant d'agir.
+- Chaque échec d'entretien dit désormais sur QUOI il portait. Sans cette
+  précision, le serveur ne distinguait pas « cette version a encore échoué » de
+  « on en essaie une autre » : il pouvait relancer sans fin. Un boîtier réel a
+  ainsi tenté 26 mises à jour en une minute le 02/08/2026.
 
 ## 0.5.0 — 2026-08-02
 
