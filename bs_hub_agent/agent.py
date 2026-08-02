@@ -100,9 +100,24 @@ class HA:
         req.add_header("Authorization", "Bearer " + self.token)
         if data is not None:
             req.add_header("Content-Type", "application/json")
-        with urllib.request.urlopen(req, timeout=self.timeout) as r:
-            txt = r.read().decode()
-            return json.loads(txt) if txt else {}
+        try:
+            with urllib.request.urlopen(req, timeout=self.timeout) as r:
+                txt = r.read().decode()
+                return json.loads(txt) if txt else {}
+        except urllib.error.HTTPError as e:
+            # ⚠️ « HTTP Error 500 » TOUT SEUL NE SERT À RIEN. Le 02/08/2026, un
+            #    refus de Home Assistant est remonté ainsi : trois numéros, zéro
+            #    raison, et il a fallu lire le code de Home Assistant pour
+            #    deviner. Le corps de la réponse contient la phrase utile — on
+            #    la garde.
+            detail = ""
+            try:
+                detail = e.read().decode()[:300]
+            except Exception:
+                pass
+            raise urllib.error.HTTPError(
+                e.url, e.code, "%s%s" % (e.reason, (" — " + detail) if detail else ""),
+                e.headers, None)
 
     def check_config(self):
         """Valide la config SANS l'appliquer. {'result':'valid'|'invalid','errors':...}"""
@@ -276,9 +291,22 @@ class Supervisor:
                     "le boîtier ne dit pas son propre nom de module : "
                     "impossible de le mettre à jour sans risquer d'en viser un autre")
             if ha is not None:
-                entite = entite_de_mise_a_jour(ha, fiche)
+                # ⛔ AVEC QUELLE IDENTITÉ ON PARLE, ET ÇA CHANGE TOUT.
+                #
+                #    L'agent s'adresse d'ordinaire à Home Assistant à travers le
+                #    Superviseur, donc AVEC SON IDENTITÉ DE MODULE. Home
+                #    Assistant voit alors « un module qui veut se remplacer » et
+                #    refuse — un « HTTP 500 » sans un mot d'explication, le
+                #    02/08/2026.
+                #
+                #    Le jeton de longue durée (celui qu'on confie à la tablette)
+                #    appartient, lui, à un vrai compte administrateur. C'est
+                #    exactement ce que fait la personne qui clique sur
+                #    « Mettre à jour » dans l'interface.
+                client = getattr(ha, "admin", None) or ha
+                entite = entite_de_mise_a_jour(client, fiche)
                 if entite:
-                    ha.call_service("update", "install", {"entity_id": entite})
+                    client.call_service("update", "install", {"entity_id": entite})
                     return {"addon": vrai, "par": entite,
                             "version": version or "celle de la boutique"}
                 # Pas d'entité : on tente quand même la porte du Superviseur.
@@ -2557,6 +2585,9 @@ def main():
     intervalle = int(os.environ.get("BS_SYNC_INTERVAL", "300"))
 
     ha = HA(ha_url, ha_token)
+    # Le même Home Assistant, mais vu par un compte administrateur. Sert aux
+    # gestes qu'un module n'a pas le droit de faire sur lui-même.
+    ha.admin = HA(ha_url, ha_token_pad) if ha_token_pad and ha_token_pad != ha_token else None
     store = Store(config_dir)
     _charger_reglages_appris()   # sinon la boucle des réglages rouvre à chaque relance
 

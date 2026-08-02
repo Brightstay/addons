@@ -1,3 +1,14 @@
+## 0.5.5 — 2026-08-02
+
+**La mise à jour à distance passe enfin, pour de bon.**
+
+- L'agent parlait à Home Assistant avec son identité de module. Home Assistant
+  voyait donc « un module qui veut se remplacer » et refusait — sans un mot
+  d'explication. Il utilise maintenant le compte administrateur dont il dispose
+  déjà : exactement ce que fait la personne qui clique sur « Mettre à jour ».
+- Les erreurs de Home Assistant ne se résument plus à un numéro. « HTTP 500 »
+  seul a coûté une heure ; le motif du refus est désormais conservé.
+
 ## 0.5.4 — 2026-08-02
 
 **Le voyageur a enfin un écran : le serveur ne démarrait jamais.**
