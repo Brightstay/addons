@@ -1414,7 +1414,19 @@ def demarrer_serveur_pad(ha_url=None, ha_token=None, ha=None, sup=None):
             #    mot de passe par la vraie clé.
             if (self.path.split("?")[0] == "/api/websocket"
                     and "websocket" in (self.headers.get("Upgrade") or "").lower()):
-                cible = _adresse_joignable(ha_url, None, None) or ha_url
+                # ⚠️ L'ADRESSE DE HOME ASSISTANT VUE PAR LE BOÎTIER, PAS CELLE
+                #    DU MODULE. `ha_url` vaut souvent « http://supervisor/core »
+                #    — une porte interne où le chemin « /api/websocket »
+                #    n'existe pas : le relais échouait, et la page ne recevait
+                #    qu'une connexion coupée, sans explication.
+                #    On repart de l'interface par laquelle la tablette vient de
+                #    nous joindre : le boîtier sait s'atteindre lui-même.
+                try:
+                    mienne = self.connection.getsockname()[0]
+                except Exception:
+                    mienne = None
+                cible = ("http://%s:8123" % mienne) if mienne else (
+                    _adresse_joignable(ha_url, None, None) or ha_url)
                 jeton = _jeton_pour_la_tablette(ha_token)
                 if not (cible and jeton):
                     self.send_response(503); self.end_headers(); return

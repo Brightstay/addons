@@ -1,3 +1,9 @@
+## 0.5.9 — 2026-08-02
+
+Le relais joignait Home Assistant par la porte interne du module, où son
+adresse n'existe pas : la tablette recevait une connexion coupée, sans
+explication. Il passe maintenant par l'adresse réelle de la machine.
+
 ## 0.5.8 — 2026-08-02
 
 Rien de neuf pour un hôte : la 0.5.7 a été publiée avec huit contrôles au
