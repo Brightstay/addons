@@ -1,3 +1,7 @@
+## 0.5.1 — 2026-08-02
+
+- À DÉCRIRE : ce que cette version change pour un hôte.
+
 ## 0.5.0 — 2026-08-02
 
 **Le voyageur a toujours un écran, même le premier jour.**

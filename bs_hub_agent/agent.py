@@ -251,8 +251,27 @@ class Supervisor:
                 raise ValueError(
                     "la boutique propose %s, la fiche demande %s — le Superviseur "
                     "n'installe que ce que la boutique offre" % (offerte, version))
-        self._req("POST", "/addons/%s/update" % slug, {}, timeout=900)
-        return {"addon": slug, "version": version or "celle de la boutique"}
+        # ⛔ « self » NE MARCHE PAS ICI, ET LE 404 NE LE DIT PAS.
+        #
+        #    Éprouvé sur le vrai boîtier le 02/08/2026 : 26 tentatives en une
+        #    minute, toutes « HTTP Error 404: Not Found ».
+        #
+        #    Le Superviseur route `/addons/{x}/update` vers le gestionnaire de
+        #    la BOUTIQUE, qui cherche un add-on nommé littéralement « self » —
+        #    il n'en trouve aucun, donc 404. Le mot « self » n'est compris que
+        #    par l'autre gestionnaire, celui de `/addons/self/info`. D'où ce
+        #    piège : la même adresse marche en lecture et échoue en écriture.
+        #
+        #    On demande donc son vrai nom au boîtier avant d'agir.
+        vrai = slug
+        if slug == "self":
+            vrai = (self._req("GET", "/addons/self/info") or {}).get("slug")
+            if not vrai:
+                raise ValueError(
+                    "le boîtier ne dit pas son propre nom d'add-on : "
+                    "impossible de le mettre à jour sans risquer de viser un autre")
+        self._req("POST", "/store/addons/%s/update" % vrai, {}, timeout=900)
+        return {"addon": vrai, "version": version or "celle de la boutique"}
 
     def maj_core(self, version):
         if not version:
@@ -1685,7 +1704,7 @@ def _rollback(store, snapshot):
 # Répartition d'UNE commande → (status, result). Fonction quasi-pure :
 # ses seules dépendances (ha, store) sont injectées → testable sans réseau.
 # =====================================================================
-def _differer(differes, nom, action, resume):
+def _differer(differes, nom, action, resume, cible=None):
     """Acquitte MAINTENANT, agit APRÈS que l'accusé de réception soit parti.
 
     Indispensable pour tout ce qui coupe le tapis sous nos pieds : mettre à
@@ -1695,7 +1714,7 @@ def _differer(differes, nom, action, resume):
     `differes = None` ⇒ mode synchrone, pour les tests unitaires."""
     if differes is None:
         return "acked", action()
-    differes.append((nom, action))
+    differes.append((nom, action, cible))
     return "acked", {"lance": resume}
 
 
@@ -1797,7 +1816,8 @@ def dispatch(cmd, ha, store, sup=None, version_ha=None, differes=None):
         version = p.get("version")
         return _differer(differes, "addon.update:" + slug,
                          lambda: sup.maj_addon(slug, version),
-                         "mise à jour de l'add-on %s vers %s" % (slug, version or "la version installée"))
+                         "mise à jour de l'add-on %s vers %s" % (slug, version or "la version installée"),
+                         cible={"version": version} if version else None)
 
     if t == "hub.core.update":
         version = p.get("version")
@@ -2330,16 +2350,23 @@ def journal_evenement(type_, severity, payload):
     })
 
 
-def _evt_maintenance(phase, quoi, detail=None):
+def _evt_maintenance(phase, quoi, detail=None, cible=None):
     """Une opération d'entretien raconte son histoire en deux temps : elle
     annonce qu'elle commence (avant de couper la parole), puis dit comment
     elle a fini. Sans le « début », un hub qui redémarre pour une mise à jour
-    légitime ressemblerait à un hub tombé en panne."""
+    légitime ressemblerait à un hub tombé en panne.
+
+    ⚠️ `cible` DIT SUR QUOI L'OPÉRATION PORTAIT — la version visée, par
+    exemple. Sans elle, le garde anti-boucle du serveur ne distingue pas
+    « la 0.5.0 a encore échoué » de « on essaie maintenant la 0.5.1 » : il
+    retient donc les deux, ou aucune. Le 02/08/2026, l'échec était muet sur ce
+    point et 26 ordres sont partis en une minute."""
     return {
         "type": "maintenance",
         "severity": "warning" if phase == "echec" else "info",
         "payload": {"phase": phase, "operation": quoi, "detail": detail or {},
-                    "agent_version": AGENT_VERSION},
+                    "agent_version": AGENT_VERSION,
+                    **({"cible": cible} if cible else {})},
         "occurred_at": _now_iso(),
         "dedup_key": "maint-%s-%s-%s" % (phase, quoi, _now_iso()),
     }
@@ -2459,17 +2486,18 @@ def main():
                 # elles n'étaient reprises qu'après le délai de re-livraison.
                 # On les garde pour le tour suivant.
                 rep2 = sync_once(hub_url, hub_key,
-                                 events=[_evt_maintenance("debut", n) for n, _ in differes],
+                                 events=[_evt_maintenance("debut", n, cible=c) for n, _, c in differes],
                                  acks=acks)
                 acks = []
                 for c in (rep2 or {}).get("commands", []) or []:
                     en_retard.append(c)
-                for nom, action in differes:
+                for nom, action, cible in differes:
                     try:
-                        evenements.append(_evt_maintenance("fin", nom, action()))
+                        evenements.append(_evt_maintenance("fin", nom, action(), cible))
                     except Exception as e:
                         print("[hub-agent] entretien KO (%s):" % nom, e, flush=True)
-                        evenements.append(_evt_maintenance("echec", nom, {"error": str(e)}))
+                        evenements.append(
+                            _evt_maintenance("echec", nom, {"error": str(e)}, cible))
                 continue        # on repart tout de suite pour remonter le résultat
 
             # Une interface fraîchement déployée n'arrive à l'écran que si
