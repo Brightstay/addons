@@ -1,3 +1,7 @@
+## 0.5.12 — 2026-08-03
+
+- À DÉCRIRE : ce que cette version change pour un hôte.
+
 ## 0.5.11 — 2026-08-03
 
 **L écran de la tablette ne se fige plus après une mise à jour.**

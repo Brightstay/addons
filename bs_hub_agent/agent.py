@@ -1708,8 +1708,110 @@ PAD_COMMANDES_AUTORISEES = {
     # Si un redémarrage est nécessaire, il se fait tablette EN MAIN.
 }
 
-# Simple CACHE (pas un état : perdu au redémarrage, on re-balaie et c'est tout).
+# ─────────────────────────────────────────────────────────────────────
+# OÙ EST LA TABLETTE, ET SUR QUEL RÉSEAU LA CHERCHER.
+#
+# ⛔ CE FUT UN CACHE EN MÉMOIRE, ET ÇA A COÛTÉ 19 HEURES D'ÉCRAN NOIR
+#    (constaté le 03/08/2026). Le commentaire disait « perdu au redémarrage,
+#    on re-balaie et c'est tout ». Les deux moitiés étaient fausses :
+#
+#      · le redémarrage n'est pas rare — il arrive à CHAQUE mise à jour de
+#        l'agent, c'est-à-dire précisément au moment où l'on a le plus besoin
+#        de retrouver la tablette ;
+#      · « on re-balaie » ne balayait pas le bon réseau (voir `_reseaux_locaux`).
+#
+#    Et le troisième filet — l'annonce que poste la tablette — ne tombe que si
+#    sa page s'affiche. Une tablette dont le navigateur ne peint plus rien
+#    n'annonce rien. Les trois secours tombaient donc ensemble, sur la même
+#    panne. On garde maintenant l'adresse SUR LE DISQUE : ce n'est pas un
+#    cache, c'est ce que le boîtier sait de sa propre tablette.
 _PAD_CONNU = {"ip": os.environ.get("BS_PAD_IP")}
+
+
+def _fichier_pad_connu():
+    return os.path.join(PAD_RACINE, "tablette.json")
+
+
+def _retenir_pad(ip=None, identite=None):
+    """Écrire ce qu'on vient d'apprendre de la tablette, pour le redémarrage."""
+    if ip:
+        _PAD_CONNU["ip"] = ip
+    if identite:
+        _PAD_CONNU["identite"] = identite
+    try:
+        os.makedirs(PAD_RACINE, exist_ok=True)
+        tmp = _fichier_pad_connu() + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump({k: v for k, v in _PAD_CONNU.items() if v}, f)
+        os.replace(tmp, _fichier_pad_connu())
+    except Exception as e:
+        # Ne JAMAIS faire échouer une sonde parce qu'un disque est plein : on
+        # perd la mémoire, pas la fonction.
+        print("[hub-agent] adresse de la tablette non conservée :", e, flush=True)
+
+
+def _relire_pad_connu():
+    try:
+        with open(_fichier_pad_connu(), encoding="utf-8") as f:
+            d = json.load(f)
+        if isinstance(d, dict):
+            for c in ("ip", "identite"):
+                if d.get(c) and not _PAD_CONNU.get(c):
+                    _PAD_CONNU[c] = d[c]
+    except Exception:
+        pass                      # première mise en route : rien à relire
+
+
+_relire_pad_connu()
+
+# LE RÉSEAU DU LOGEMENT, appris du Superviseur et conservé.
+# L'add-on ne tourne PAS sur le réseau de la maison : vu de son conteneur, le
+# seul réseau visible est celui de Docker (172.30.32.x). Seul le Superviseur
+# voit les interfaces de la machine. On retient donc ce qu'il dit, et on le
+# garde — sinon un redémarrage sans Superviseur joignable rendrait le boîtier
+# aveugle une fois de plus.
+_RESEAU_LOGEMENT = {"base": os.environ.get("BS_PAD_RESEAU")}
+
+
+def _fichier_reseau_logement():
+    return os.path.join(PAD_RACINE, "reseau.txt")
+
+
+def retenir_reseau_du_logement(adresse):
+    """`192.168.0.32` → on retient `192.168.0`, le réseau où chercher."""
+    if not adresse or not isinstance(adresse, str):
+        return None
+    morceaux = adresse.strip().split(".")
+    if len(morceaux) != 4 or not all(m.isdigit() for m in morceaux):
+        return None
+    base = ".".join(morceaux[:3])
+    if base == _RESEAU_LOGEMENT.get("base"):
+        return base                       # déjà connu : pas d'écriture inutile
+    _RESEAU_LOGEMENT["base"] = base
+    try:
+        os.makedirs(PAD_RACINE, exist_ok=True)
+        tmp = _fichier_reseau_logement() + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            f.write(base)
+        os.replace(tmp, _fichier_reseau_logement())
+    except Exception as e:
+        print("[hub-agent] réseau du logement non conservé :", e, flush=True)
+    return base
+
+
+def _relire_reseau_logement():
+    if _RESEAU_LOGEMENT.get("base"):
+        return
+    try:
+        with open(_fichier_reseau_logement(), encoding="utf-8") as f:
+            base = f.read().strip()
+        if base:
+            _RESEAU_LOGEMENT["base"] = base
+    except Exception:
+        pass
+
+
+_relire_reseau_logement()
 
 
 # ---------------------------------------------------------------------
@@ -1862,6 +1964,23 @@ def _reseaux_locaux():
     if force:
         return [force]                  # l'image dorée sait mieux que nous
 
+    # ⛔ LE RÉSEAU DU LOGEMENT D'ABORD, ET IL NE VIENT PAS D'ICI.
+    #
+    # Tout ce qui suit lit le réseau vu DEPUIS LE CONTENEUR de l'add-on —
+    # c'est-à-dire le réseau privé de Docker, `172.30.32.x`. La tablette n'y
+    # est jamais. Le balayage sondait donc consciencieusement 254 adresses où
+    # elle ne pouvait pas se trouver, et rendait « aucune tablette » : une
+    # réponse fausse qui a l'air d'une réponse.
+    #
+    # C'EST EXACTEMENT L'ERREUR DÉJÀ TROUVÉE ET CORRIGÉE POUR `_adresse_locale`
+    # le 02/08 (« elle a rendu 172.30.33.0, l'adresse du CONTENEUR »). La leçon
+    # avait été apprise à un endroit et jamais reportée ici : le boîtier savait
+    # dire où il était, et cherchait quand même au mauvais endroit. Le seul qui
+    # voit les interfaces de la machine est le Superviseur — `instantane_sante`
+    # nous transmet ce qu'il en dit par `retenir_reseau_du_logement`.
+    if _RESEAU_LOGEMENT.get("base"):
+        ajouter(_RESEAU_LOGEMENT["base"] + ".1")
+
     # Sur le hub (Linux), on LIT les vrais réseaux au lieu de supposer. Un
     # /24 (254 adresses) est le cas de toutes les box grand public — mais pas
     # d'un réseau d'entreprise. Deux garde-fous : on ne balaie que les réseaux
@@ -1904,6 +2023,12 @@ def _reseaux_locaux():
     return bases[:4]                    # au-delà, c'est du balayage pour rien
 
 
+# CE QU'A DONNÉ LE DERNIER BALAYAGE. Sans ça, « aucune tablette » est un mot
+# unique pour trois pannes très différentes : rien sur le réseau, mauvais
+# réseau balayé, ou tablette présente qui refuse le mot de passe.
+_DERNIER_BALAYAGE = {"reseaux": [], "ouverts": 0, "refus": 0}
+
+
 def trouver_pads(mot_de_passe, timeout=0.35, limite=None):
     """TOUS les pads du réseau, dans l'ordre où on les rencontre.
 
@@ -1932,20 +2057,33 @@ def trouver_pads(mot_de_passe, timeout=0.35, limite=None):
             s.close()
 
     trouves = []
+    _DERNIER_BALAYAGE.update({"reseaux": [], "ouverts": 0, "refus": 0})
     for base in _reseaux_locaux():
+        _DERNIER_BALAYAGE["reseaux"].append(base + ".0/24")
         adresses = ["%s.%d" % (base, n) for n in range(1, 255)]
         with ThreadPoolExecutor(max_workers=48) as ex:
             for ip in ex.map(ouvert, adresses):
                 if not ip:
                     continue
+                # ⚠️ QUELQU'UN RÉPOND ICI. On le compte AVANT d'essayer de lui
+                #    parler : c'est ce chiffre qui distingue « il n'y a personne
+                #    sur ce réseau » de « la tablette est là mais refuse ».
+                _DERNIER_BALAYAGE["ouverts"] += 1
                 try:
                     # port ouvert ≠ notre pad : on vérifie que c'est bien Fully
                     if Pad(ip, mot_de_passe, timeout=4).info().get("packageName"):
                         trouves.append(ip)
                         if limite and len(trouves) >= limite:
                             return trouves
+                    else:
+                        _DERNIER_BALAYAGE["refus"] += 1
                 except Exception:
-                    pass
+                    # ⛔ CE `pass` A COÛTÉ UNE NUIT. Une tablette bien vivante
+                    #    qui refuse notre mot de passe tombait ici, en silence,
+                    #    et le boîtier rapportait « aucune tablette » — le même
+                    #    mot que pour une tablette éteinte. Deux pannes qui
+                    #    n'ont RIEN à voir, un seul message. On les sépare.
+                    _DERNIER_BALAYAGE["refus"] += 1
     return trouves
 
 
@@ -2007,16 +2145,17 @@ def _pad(mot_de_passe=None, rebalayer=True):
                 print("[hub-agent] pad inattendu en %s (identité %s ≠ %s) — ignoré"
                       % (ip, identite, attendue), flush=True)
                 continue
-            if identite and not attendue:
-                _PAD_CONNU["identite"] = identite
-            _PAD_CONNU["ip"] = ip
+            # On ÉCRIT ce qu'on vient d'apprendre : le prochain démarrage
+            # de l'agent doit repartir d'ici, pas de zéro.
+            _retenir_pad(ip=ip, identite=identite if not attendue else None)
             return Pad(ip, mdp)
         except Exception:
             pass
     if not rebalayer:
         return None
     ip = trouver_pad(mdp)
-    _PAD_CONNU["ip"] = ip
+    if ip:
+        _retenir_pad(ip=ip)
     return Pad(ip, mdp) if ip else None
 
 
@@ -2042,6 +2181,18 @@ def etat_pad(mot_de_passe=None):
         socle["joignable"] = False
         if socle.get("annonce_vu_a"):
             socle["isolee"] = True
+        # POURQUOI on ne l'a pas trouvée. Trois pannes portaient le même mot.
+        if _DERNIER_BALAYAGE.get("reseaux"):
+            socle["balayage"] = {
+                "reseaux": list(_DERNIER_BALAYAGE["reseaux"]),
+                "machines_ouvertes": _DERNIER_BALAYAGE["ouverts"],
+                "refus": _DERNIER_BALAYAGE["refus"],
+            }
+            if _DERNIER_BALAYAGE["refus"]:
+                # Quelqu'un répond sur le port de la tablette et n'accepte pas
+                # notre mot de passe : la tablette est LÀ, c'est le secret qui
+                # ne correspond pas. Panne complètement différente.
+                socle["mot_de_passe_refuse"] = True
         return socle
     try:
         info = p.info()
@@ -2906,6 +3057,20 @@ def instantane_sante(ha, sup=None, store=None):
             except Exception as e:
                 snap[nom + "_erreur"] = str(e)[:120]
 
+    # ⚠️ AVANT DE SONDER LA TABLETTE, SAVOIR OÙ CHERCHER.
+    #    Cet appel était plus bas dans la fonction — donc APRÈS `etat_pad()`,
+    #    qui a besoin du réseau du logement pour balayer. Le boîtier apprenait
+    #    son adresse une fraction de seconde trop tard, à chaque tour, et la
+    #    recherche de la tablette partait toujours sur le réseau de Docker.
+    #    L'ordre des lignes était toute la panne.
+    adresse_du_hub = None
+    try:
+        adresse_du_hub = _adresse_locale(sup)
+        if adresse_du_hub:
+            retenir_reseau_du_logement(adresse_du_hub)
+    except Exception as e:
+        snap["adresse_locale_erreur"] = str(e)[:120]
+
     try:
         # on dit si le hub PEUT parler à la tablette — jamais avec quoi
         snap["pad_acces"] = bool(_mdp_pad())
@@ -2958,12 +3123,15 @@ def instantane_sante(ha, sup=None, store=None):
     #    · CE QU'ELLE SAIT METTRE À JOUR. Sans la liste, on devine des noms
     #      d'entités — et Home Assistant ignore EN SILENCE celles qui n'existent
     #      pas. On croit avoir agi ; rien ne se passe.
-    try:
-        adresse = _adresse_locale(sup)
-        if adresse:
-            snap["adresse_locale"] = adresse
-    except Exception as e:
-        snap["adresse_locale_erreur"] = str(e)[:120]
+    # (l'adresse a été lue plus haut : la sonde de la tablette en dépend)
+    if adresse_du_hub:
+        snap["adresse_locale"] = adresse_du_hub
+    if _RESEAU_LOGEMENT.get("base"):
+        # Ce que le boîtier balaie pour retrouver sa tablette. Sans ce
+        # renseignement, « aucune tablette trouvée » est indiscernable de
+        # « j'ai cherché au mauvais endroit » — c'est ce qui nous a coûté
+        # une nuit.
+        snap["reseau_balaye"] = _RESEAU_LOGEMENT["base"] + ".0/24"
 
     try:
         maj = _entites_de_mise_a_jour(ha)
