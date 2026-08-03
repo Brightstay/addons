@@ -20,6 +20,7 @@ Stdlib uniquement (urllib) : aucune dépendance à installer.
 import hashlib
 import hmac
 import json
+import re
 import os
 import threading
 import time
@@ -199,6 +200,20 @@ class Supervisor:
             rep = json.loads(txt) if txt else {}
             # Le Superviseur enveloppe tout dans {result, data}
             return rep.get("data", rep)
+
+    def texte(self, path, timeout=None):
+        """Une réponse EN TEXTE, pas en JSON.
+
+        ⛔ `_req` fait `json.loads` sur tout. Les journaux (`/core/logs`,
+           `/addons/self/logs`…) sont du texte brut : le lecteur normal aurait
+           levé une erreur de décodage à la première ligne, et le message
+           n'aurait parlé que de JSON — jamais du journal qu'on essayait de
+           lire. Deux formats, deux lecteurs.
+        """
+        req = urllib.request.Request(self.base + path, method="GET")
+        req.add_header("Authorization", "Bearer " + self.token)
+        with urllib.request.urlopen(req, timeout=timeout or self.timeout) as r:
+            return r.read().decode("utf-8", "replace")
 
     # --- lecture ------------------------------------------------------
     def info(self):
@@ -2026,7 +2041,19 @@ def _reseaux_locaux():
 # CE QU'A DONNÉ LE DERNIER BALAYAGE. Sans ça, « aucune tablette » est un mot
 # unique pour trois pannes très différentes : rien sur le réseau, mauvais
 # réseau balayé, ou tablette présente qui refuse le mot de passe.
-_DERNIER_BALAYAGE = {"reseaux": [], "ouverts": 0, "refus": 0}
+_DERNIER_BALAYAGE = {"reseaux": [], "ouverts": 0, "refus": 0, "quand": 0.0}
+
+# ⛔ UN BALAYAGE PAR DEMI-HEURE, PAS TOUTES LES CINQ MINUTES.
+#    `etat_pad` tourne à chaque tour et rebalaie dès que le pad ne répond pas
+#    — c'est-à-dire EN PERMANENCE tant qu'il est en panne. Tant que le balayage
+#    visait le réseau de Docker c'était inutile mais inoffensif ; depuis qu'il
+#    vise le vrai réseau du logement (0.5.12), ce sont 254 adresses sondées
+#    288 fois par jour CHEZ UN CLIENT. Des box le signalent comme une attaque,
+#    et une petite machine y passe du temps pour rien : une tablette qui n'a
+#    pas bougé en cinq minutes n'aura pas bougé non plus à l'essai suivant.
+#    Entre deux balayages, l'adresse connue et l'annonce restent essayées à
+#    chaque tour — c'est le chemin normal, et il est gratuit.
+BALAYAGE_MIN_S = int(os.environ.get("BS_PAD_BALAYAGE_MIN", "1800"))
 
 
 def trouver_pads(mot_de_passe, timeout=0.35, limite=None):
@@ -2153,6 +2180,10 @@ def _pad(mot_de_passe=None, rebalayer=True):
             pass
     if not rebalayer:
         return None
+    depuis = time.time() - float(_DERNIER_BALAYAGE.get("quand") or 0)
+    if depuis < BALAYAGE_MIN_S:
+        return None
+    _DERNIER_BALAYAGE["quand"] = time.time()
     ip = trouver_pad(mdp)
     if ip:
         _retenir_pad(ip=ip)
@@ -2557,7 +2588,99 @@ def dispatch(cmd, ha, store, sup=None, version_ha=None, differes=None):
             "addons": {a.get("slug"): a.get("version") for a in addons},
         }
 
+    if t == "hub.logs":
+        return lire_journal(sup, p.get("source"), p.get("lignes"))
+
     return "failed", {"error": "type de commande inconnu : " + str(t)}
+
+
+# =====================================================================
+# LIRE UN JOURNAL — et n'en laisser sortir aucun secret.
+# =====================================================================
+
+# Ce qu'on accepte de lire. ⛔ PAS DE CHEMIN LIBRE : le nom vient du serveur,
+# et il finit dans une adresse du Superviseur. Une liste fermée, et rien d'autre.
+SOURCES_JOURNAL = {
+    "agent": "/addons/self/logs",
+    "core": "/core/logs",
+    "superviseur": "/supervisor/logs",
+    "machine": "/host/logs",
+}
+
+# ⛔ CE QUE LES JOURNAUX DE HOME ASSISTANT CONTIENNENT VRAIMENT.
+#    Des jetons de longue durée, le MOT DE PASSE DE LA TABLETTE, des clés
+#    d'API, le nom du Wi-Fi du logement, parfois des noms de voyageurs. Le
+#    journal des commandes ne rend déjà le contenu que pour une liste blanche,
+#    précisément pour ça. Diffuser un journal brut dans un navigateur défait
+#    cette précaution en une ligne — on caviarde donc AVANT l'envoi, jamais
+#    après : ce qui n'est pas parti ne peut pas fuir.
+_MASQUES = [
+    # Jetons JWT (Home Assistant, Supabase) — trois blocs base64 séparés de points.
+    (re.compile(r"\beyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}"), "«jeton»"),
+    # « token=... », « password: ... », « api_key ... » et leurs variantes.
+    # ⛔ LE MOT-CLÉ PEUT ÊTRE COLLÉ À UN AUTRE, ET C'EST LE CAS QUI COMPTE.
+    #    Première version : `\bpassword\b`. Elle laissait passer
+    #    `remoteAdminPassword=…` — c'est-à-dire EXACTEMENT le mot de passe de
+    #    la tablette, celui que les journaux de l'agent écrivent. Un contrôle
+    #    l'a prise en défaut. On accepte donc un préfixe collé.
+    (re.compile(r"(?i)\b([\w.-]*(?:token|password|passwd|mot_de_passe|secret|"
+                r"api[_-]?key|apikey|authorization|bearer|hub[_-]?key|"
+                r"service[_-]?role))\b\s*[:=]?\s*"
+                r"[\"']?([A-Za-z0-9._~+/\-]{8,})[\"']?"), r"\1=«masqué»"),
+    # Une longue suite de base64 isolée : presque toujours une clé.
+    (re.compile(r"\b[A-Za-z0-9+/]{40,}={0,2}\b"), "«masqué»"),
+]
+
+
+def caviarder(texte):
+    """Retirer d'un journal ce qui ne doit jamais atteindre un navigateur."""
+    for motif, remplacement in _MASQUES:
+        texte = motif.sub(remplacement, texte)
+    return texte
+
+
+def lire_journal(sup, source, lignes=None):
+    """Les dernières lignes d'un journal, caviardées.
+
+    ⚠️ RIEN N'EST CONSERVÉ. Le texte transite par le résultat de la commande,
+    que le serveur efface dès qu'il l'a servi. C'est le seul chemin possible :
+    le hub ne sait parler que par cette file — mais il n'y a aucune raison d'y
+    laisser quoi que ce soit.
+    """
+    if sup is None:
+        return "failed", {"error": "Superviseur indisponible — l'add-on doit tourner "
+                                   "sur une machine Home Assistant OS."}
+    chemin = SOURCES_JOURNAL.get(str(source or "agent"))
+    if not chemin:
+        return "failed", {"error": "source inconnue : %s (attendu : %s)"
+                                   % (source, ", ".join(sorted(SOURCES_JOURNAL)))}
+    try:
+        brut = sup.texte(chemin, timeout=30)
+    except Exception as e:
+        return "failed", {"error": "journal illisible : %s" % str(e)[:160]}
+
+    if isinstance(brut, (bytes, bytearray)):
+        brut = brut.decode("utf-8", "replace")
+    brut = str(brut or "")
+
+    try:
+        n = max(20, min(int(lignes or 200), 500))
+    except (TypeError, ValueError):
+        n = 200
+    dernieres = brut.rstrip("\n").split("\n")[-n:]
+    texte = caviarder("\n".join(dernieres))
+
+    # ⚠️ Un plafond dur : un journal de Home Assistant peut peser plusieurs
+    #    mégaoctets, et il passerait dans une file faite pour des ordres.
+    if len(texte) > 120_000:
+        texte = "…(début coupé)…\n" + texte[-120_000:]
+
+    return "acked", {
+        "source": source or "agent",
+        "lignes": len(dernieres),
+        "texte": texte,
+        "lu_a": _now_iso(),
+    }
 
 
 # =====================================================================
@@ -2969,6 +3092,37 @@ def entite_de_mise_a_jour(ha, fiche):
     return replis
 
 
+# Ce qui appartient à Home Assistant lui-même, et jamais au logement.
+# ⚠️ On ne liste QUE des familles entières et des préfixes sans ambiguïté :
+#    un filtre trop large cacherait un vrai appareil, ce qui serait bien pire
+#    que le bruit qu'on supprime. Dans le doute, on compte.
+_FAMILLES_INTERNES = ("conversation.", "tts.", "stt.", "person.", "zone.",
+                      "todo.", "assist_satellite.")
+_PREFIXES_INTERNES = ("update.", "sensor.home_assistant_",
+                      "binary_sensor.remote_ui")
+# ⛔ CEUX-LÀ SE NOMMENT EN ENTIER, PAS PAR PRÉFIXE.
+#    Première version : `sensor.backup_`. Un contrôle l'a prise en défaut avec
+#    `sensor.backup_battery_niveau` — une pile de secours, c'est-à-dire un VRAI
+#    appareil, et de sécurité. Le filtre l'aurait masquée. Un préfixe est une
+#    devinette ; ces quatre entités-là ont un nom fixe, imposé par Home
+#    Assistant. On les écrit.
+_ENTITES_INTERNES = frozenset((
+    "event.backup_automatic_backup",
+    "sensor.backup_last_attempted_automatic_backup",
+    "sensor.backup_last_successful_automatic_backup",
+    "sensor.backup_next_scheduled_automatic_backup",
+    "sensor.backup_backup_manager_state",
+))
+
+
+def _plomberie_ha(entity_id):
+    """Cette entité est-elle de la mécanique de Home Assistant ?"""
+    e = (entity_id or "").lower()
+    return (e in _ENTITES_INTERNES
+            or e.startswith(_FAMILLES_INTERNES)
+            or e.startswith(_PREFIXES_INTERNES))
+
+
 def instantane_sante(ha, sup=None, store=None):
     """Ce que le hub VOIT, à chaque contact.
 
@@ -2998,14 +3152,24 @@ def instantane_sante(ha, sup=None, store=None):
 
     try:
         etats = ha.states() or []
-        indispo, secu, piles = [], [], []
+        indispo, secu, piles, interne = [], [], [], []
         for e in etats:
             attrs = e.get("attributes") or {}
             eid = e.get("entity_id", "")
             valeur = e.get("state")
             classe = attrs.get("device_class")
             if valeur in ("unavailable", "unknown"):
-                indispo.append(eid)
+                # ⛔ LA PLOMBERIE DE HOME ASSISTANT N'EST PAS UNE PANNE.
+                #    Le 03/08, un hub d'essai affichait « 7 hors ligne » : zéro
+                #    appareil du logement. C'étaient l'assistant vocal jamais
+                #    activé, la voix de synthèse Google jamais sollicitée, la
+                #    « personne » sans téléphone, et les trois capteurs de
+                #    sauvegarde automatique qui n'ont rien à dire tant qu'aucune
+                #    n'est programmée. Un exploitant qui lit « 7 hors ligne »
+                #    part chercher sept pannes qui n'existent pas — et le jour
+                #    où un VRAI détecteur se tait, il est noyé dans le même
+                #    chiffre. On les compte à part.
+                (interne if _plomberie_ha(eid) else indispo).append(eid)
                 if classe in CLASSES_SECURITE:
                     secu.append(eid)
             if classe == "battery":
@@ -3018,6 +3182,9 @@ def instantane_sante(ha, sup=None, store=None):
         snap["entites"] = len(etats)
         snap["indisponibles"] = len(indispo)
         snap["indisponibles_liste"] = sorted(indispo)[:MAX_LISTE]
+        # Comptés, mais à part : ce ne sont pas des appareils du logement.
+        snap["interne_muet"] = len(interne)
+        snap["interne_muet_liste"] = sorted(interne)[:MAX_LISTE]
         snap["securite_muets"] = sorted(secu)[:MAX_LISTE]
         snap["piles_faibles"] = sorted(piles, key=lambda p: p["niveau"])[:MAX_LISTE]
     except Exception as e:
