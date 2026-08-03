@@ -1,3 +1,7 @@
+## 0.5.15 — 2026-08-03
+
+- À DÉCRIRE : ce que cette version change pour un hôte.
+
 ## 0.5.14 — 2026-08-03
 
 - À DÉCRIRE : ce que cette version change pour un hôte.

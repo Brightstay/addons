@@ -45,6 +45,13 @@ AGENT_VERSION = "0.3.0"
 # Sous-arbres du dossier de config que l'agent a le droit d'écrire. Tout le
 # reste (configuration.yaml, secrets, automations de l'hôte) est intouchable.
 CHEMINS_AUTORISES = ("automations_brightstay/", "blueprints/", "packages/brightstay")
+
+# Ce qu'il faut trouver dans `configuration.yaml` pour que nos fichiers soient
+# LUS. Sans ces lignes, on écrit dans un dossier que personne ne regarde.
+INCLUSIONS_ATTENDUES = {
+    "packages/": "packages",
+    "automations_brightstay/": "automations_brightstay",
+}
 DOMAINES_RECHARGEABLES = {"automation", "script", "template", "input_boolean",
                           "input_number", "input_select", "scene", "group"}
 
@@ -318,10 +325,28 @@ class Supervisor:
                 #    appartient, lui, à un vrai compte administrateur. C'est
                 #    exactement ce que fait la personne qui clique sur
                 #    « Mettre à jour » dans l'interface.
-                client = getattr(ha, "admin", None) or ha
+                admin = getattr(ha, "admin", None)
+                client = admin or ha
                 entite = entite_de_mise_a_jour(client, fiche)
                 if entite:
-                    client.call_service("update", "install", {"entity_id": entite})
+                    # ⛔ ON ESSAIE, PUIS ON EXPLIQUE — on ne refuse pas d'avance.
+                    #    Le 03/08, l'agent a rendu « HTTP Error 403: Forbidden »,
+                    #    trois fois, sans jamais dire quoi faire. La cause la plus
+                    #    probable est connue : pas de compte administrateur. On la
+                    #    dit AU MOMENT de l'échec, sans présumer qu'elle est la
+                    #    seule — un refus d'avance interdirait des cas qui
+                    #    marchent (un `ha` déjà administrateur, par exemple).
+                    try:
+                        client.call_service("update", "install", {"entity_id": entite})
+                    except Exception as e:
+                        if admin is None:
+                            raise PermissionError(
+                                "%s — aucun compte administrateur sur ce boîtier. "
+                                "Un module n'a pas le droit de se remplacer lui-même, "
+                                "et sans jeton l'agent ne peut pas le demander à Home "
+                                "Assistant. Posez-le avec « node dev/jeton-tablette.mjs » "
+                                "depuis le réseau du logement." % e) from e
+                        raise
                     return {"addon": vrai, "par": entite,
                             "version": version or "celle de la boutique"}
                 # Pas d'entité : on tente quand même la porte du Superviseur.
@@ -2300,6 +2325,102 @@ def etat_pad(mot_de_passe=None):
     return etat
 
 
+def configuration_lit(config_dir, dossier):
+    """Home Assistant lit-il ce dossier ?
+
+    ⛔ LE DÉFAUT QUE ÇA CORRIGE, ET IL EST DE LA PIRE ESPÈCE. Le 03/08/2026,
+       `hub.apply` a écrit un paquet dans `packages/`, a répondu
+       « appliqué : packages/brightstay_maj.yaml », rechargé le domaine — et
+       RIEN n'existait. `configuration.yaml` de ce boîtier ne contient aucune
+       inclusion : l'agent écrivait dans un dossier que personne ne regarde,
+       et affirmait un succès. Un échec franc coûte cinq minutes ; un faux
+       succès a coûté une après-midi.
+    """
+    marqueur = INCLUSIONS_ATTENDUES.get(dossier)
+    if not marqueur:
+        return True                       # dossier sans exigence connue
+    try:
+        with open(os.path.join(config_dir, "configuration.yaml"), encoding="utf-8") as f:
+            texte = f.read()
+    except OSError:
+        return None                       # illisible : on ne sait pas, on ne ment pas
+    for ligne in texte.split("\n"):
+        nue = ligne.strip()
+        if nue.startswith("#"):
+            continue
+        if marqueur in nue and "!include" in nue:
+            return True
+    return False
+
+
+def assurer_inclusions(config_dir, ha=None):
+    """Garantir que Home Assistant LIT les dossiers où l'agent écrit.
+
+    ⛔ LE DÉFAUT, ET IL EST DE LA PIRE ESPÈCE. Le 03/08/2026, `hub.apply` a
+       écrit un paquet, répondu « appliqué », rechargé le domaine — et rien
+       n'existait. `configuration.yaml` n'incluait ni `packages/` ni
+       `automations_brightstay/`. L'agent écrivait dans un dossier que
+       personne ne regarde, en affirmant un succès. Un échec franc coûte cinq
+       minutes ; un faux succès a coûté une après-midi.
+
+    ⚠️ ON N'AJOUTE QUE CE QUI MANQUE, ET ON VÉRIFIE APRÈS. Si la configuration
+       devient invalide, on remet l'ancienne : mieux vaut un dossier non lu
+       qu'un Home Assistant qui ne démarre plus.
+
+    ⚠️ ET C'EST L'AGENT QUI LE FAIT, PAS L'ATELIER. Les boîtiers déjà partis
+       n'ont jamais vu l'atelier corrigé ; ils verront cet agent-ci.
+    """
+    chemin = os.path.join(config_dir, "configuration.yaml")
+    try:
+        with open(chemin, encoding="utf-8") as f:
+            avant = f.read()
+    except OSError as e:
+        print("[hub-agent] configuration.yaml illisible :", e, flush=True)
+        return None
+
+    ajouts = []
+    utiles = [l.strip() for l in avant.split("\n") if not l.strip().startswith("#")]
+    if not any("packages:" in l and "!include" in l for l in utiles):
+        ajouts.append("homeassistant:\n  packages: !include_dir_named packages")
+    if not any("automations_brightstay" in l for l in utiles):
+        ajouts.append(
+            '"automation brightstay": !include_dir_merge_list automations_brightstay/')
+    if not ajouts:
+        return True
+
+    for d in ("packages", "automations_brightstay"):
+        try:
+            os.makedirs(os.path.join(config_dir, d), exist_ok=True)
+        except OSError:
+            pass
+
+    apres = avant.rstrip("\n") + "\n\n# ── Brightstay — posé par l'agent, ne pas retirer ──\n" \
+        + "\n".join(ajouts) + "\n"
+    try:
+        with open(chemin, "w", encoding="utf-8") as f:
+            f.write(apres)
+    except OSError as e:
+        print("[hub-agent] inclusions non posées :", e, flush=True)
+        return False
+
+    # Vérifier, et défaire si on a cassé quelque chose.
+    if ha is not None:
+        try:
+            v = ha.check_config() or {}
+            if v.get("result") == "invalid" or v.get("errors"):
+                with open(chemin, "w", encoding="utf-8") as f:
+                    f.write(avant)
+                print("[hub-agent] inclusions ANNULÉES (configuration invalide) :",
+                      str(v.get("errors"))[:200], flush=True)
+                return False
+        except Exception as e:
+            print("[hub-agent] configuration non vérifiée après ajout :", e, flush=True)
+
+    print("[hub-agent] inclusions posées dans configuration.yaml :",
+          len(ajouts), "— redémarrez Home Assistant pour qu'elles prennent", flush=True)
+    return True
+
+
 # =====================================================================
 # Dépôt de fichiers — écriture GARDÉE dans le dossier de config du hub.
 # =====================================================================
@@ -2389,6 +2510,17 @@ def dispatch(cmd, ha, store, sup=None, version_ha=None, differes=None):
         # le hub garde exactement ce qui marchait avant. C'est ça, le fail-safe.
         files = p.get("files", [])
         reload_domains = p.get("reload", [])
+
+        # ⛔ NE JAMAIS RÉPONDRE « APPLIQUÉ » POUR UN FICHIER QUE PERSONNE NE LIT.
+        for f in files:
+            chemin = str(f.get("path") or "")
+            dossier = chemin.split("/")[0] + "/" if "/" in chemin else chemin
+            lu = configuration_lit(store.root, dossier)
+            if lu is False:
+                return "failed", {"error":
+                    "« %s » n'est pas inclus dans la configuration de ce boîtier : "
+                    "le fichier serait écrit et jamais lu. Posez l'inclusion "
+                    "(atelier-hub.mjs le fait depuis le 03/08/2026)." % dossier}
         for d in reload_domains:
             if d not in DOMAINES_RECHARGEABLES:
                 return "failed", {"error": "domaine non rechargeable : " + str(d)}
@@ -3246,6 +3378,10 @@ def instantane_sante(ha, sup=None, store=None):
         # que tant qu'il croit le hub démuni, et le mot de passe suffisait à le
         # rassurer.
         snap["pad_maintenance"] = bool(_code_maintenance())
+        # ⚠️ LA MESURE QUI MANQUAIT. Sans elle, impossible de savoir à distance
+        #    pourquoi une mise à jour échoue — il a fallu lire le code, deviner,
+        #    et essayer trois fois. Un booléen l'aurait dit tout de suite.
+        snap["ha_admin"] = getattr(ha, "admin", None) is not None
         pad = etat_pad()
         if pad is not None:
             snap["pad"] = pad
@@ -3388,6 +3524,12 @@ def main():
     # gestes qu'un module n'a pas le droit de faire sur lui-même.
     ha.admin = HA(ha_url, ha_token_pad) if ha_token_pad and ha_token_pad != ha_token else None
     store = Store(config_dir)
+    # Avant tout : que nos dossiers soient LUS. Sans ça, chaque `hub.apply`
+    # écrira dans le vide en répondant « appliqué ».
+    try:
+        assurer_inclusions(config_dir, ha)
+    except Exception as e:
+        print("[hub-agent] inclusions non vérifiées :", e, flush=True)
     _charger_reglages_appris()   # sinon la boucle des réglages rouvre à chaque relance
 
     # Le Superviseur n'existe que sur un vrai hub Home Assistant. Sans lui,
