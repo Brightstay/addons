@@ -1,3 +1,16 @@
+## 0.5.11 — 2026-08-03
+
+**L écran de la tablette ne se fige plus après une mise à jour.**
+
+- Le mot de passe qui relie la tablette au boîtier était tiré à neuf à chaque
+  redémarrage de l agent. La page du salon garde celui qu elle a lu au
+  chargement : après une mise à jour, elle restait bloquée sur son écran de
+  chargement, sans erreur ni alerte — et la flotte affichait « en ligne ».
+  Chaque mise à jour aurait éteint l écran de tous les logements.
+- Il est maintenant conservé sur le boîtier, lisible par lui seul.
+- Le relais abandonne plus vite une porte qui ne répond pas : quelques
+  centaines de millisecondes au lieu de vingt secondes d écran blanc.
+
 ## 0.5.10 — 2026-08-02
 
 Le relais cherche Home Assistant par les quatre portes possibles au lieu d'en

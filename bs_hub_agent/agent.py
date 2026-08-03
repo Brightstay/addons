@@ -1078,10 +1078,53 @@ CLE_WS = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"   # constante du protocole
 _MDP_RELAIS = None
 
 
+def _mdp_relais_chemin():
+    return os.path.join(PAD_RACINE, "relais.txt")
+
+
 def mot_de_passe_relais():
+    """Le mot de passe que la tablette présente au relais.
+
+    ⛔ IL SURVIT AUX REDÉMARRAGES, ET C'EST TOUT LE PROBLÈME QU'IL RÉSOUT.
+       Première version : tiré à neuf à chaque démarrage de l'agent. La page du
+       salon, elle, garde celui qu'elle a lu au chargement — et rien ne la fait
+       le relire. Résultat observé sur le vrai boîtier dans la nuit du
+       02/08/2026 : après une mise à jour de l'agent, la tablette est restée
+       BLOQUÉE SUR SON ÉCRAN DE CHARGEMENT toute la nuit. Pas d'erreur, pas
+       d'alerte : un panneau mural inerte, et la flotte affichait « en ligne ».
+
+       Chaque mise à jour que nous poussons aurait donc cassé l'écran de tous
+       les logements, jusqu'à ce que quelqu'un recharge la page à la main.
+
+    ⚠️ Il est écrit à côté de la configuration du logement, dans le dossier de
+       données de l'add-on — pas dans le paquet de l'interface, qui est
+       remplacé à chaque déploiement.
+    """
     global _MDP_RELAIS
-    if _MDP_RELAIS is None:
-        _MDP_RELAIS = "relais_" + hashlib.sha256(os.urandom(32)).hexdigest()[:32]
+    if _MDP_RELAIS:
+        return _MDP_RELAIS
+    chemin = _mdp_relais_chemin()
+    try:
+        with open(chemin, encoding="utf-8") as f:
+            garde = f.read().strip()
+        if garde.startswith("relais_") and len(garde) >= 32:
+            _MDP_RELAIS = garde
+            return _MDP_RELAIS
+    except OSError:
+        pass
+    _MDP_RELAIS = "relais_" + hashlib.sha256(os.urandom(32)).hexdigest()[:32]
+    try:
+        os.makedirs(PAD_RACINE, exist_ok=True)
+        tmp = chemin + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            f.write(_MDP_RELAIS)
+        os.chmod(tmp, 0o600)
+        os.replace(tmp, chemin)
+    except OSError as e:
+        # Pas de disque : on garde en mémoire. L'écran marchera jusqu'au
+        # prochain redémarrage — mieux que rien, et on le DIT.
+        print("[hub-agent] ⚠ mot de passe du relais non conservé (%s) : "
+              "l'écran de la tablette se figera au prochain redémarrage" % e, flush=True)
     return _MDP_RELAIS
 
 
@@ -1188,7 +1231,12 @@ def _ouvrir_amont(adresse_ha):
         port = u.port or (443 if u.scheme == "https" else 80)
         amont = None
         try:
-            amont = _sock.create_connection((hote, port), timeout=5)
+            # ⚠️ COURT, ET C'EST DÉLIBÉRÉ. On essaie jusqu'à quatre portes :
+            #    à cinq secondes chacune, la tablette attendrait vingt secondes
+            #    devant un écran de chargement avant le premier octet. Une porte
+            #    qui existe répond en quelques millisecondes sur un réseau
+            #    local ; une qui n'existe pas doit être abandonnée vite.
+            amont = _sock.create_connection((hote, port), timeout=1.5)
             if u.scheme == "https":
                 import ssl as _ssl
                 amont = _ssl.create_default_context().wrap_socket(amont, server_hostname=hote)
@@ -1208,7 +1256,7 @@ def _ouvrir_amont(adresse_ha):
                 entetes.append("Authorization: Bearer %s" % jeton_sup)
             amont.sendall(("\r\n".join(entetes) + "\r\n\r\n").encode())
 
-            amont.settimeout(6)
+            amont.settimeout(4)
             tampon = b""
             while b"\r\n\r\n" not in tampon:
                 bloc = amont.recv(4096)
