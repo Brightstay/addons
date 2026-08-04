@@ -19,6 +19,7 @@ Stdlib uniquement (urllib) : aucune dépendance à installer.
 """
 import hashlib
 import hmac
+import glob
 import json
 import re
 import os
@@ -1079,9 +1080,25 @@ def config_pour_la_tablette(url_ha, jeton_ha, adresse_locale, en_tete_host=None)
     # ⛔ CE QUE LA TABLETTE NE DOIT JAMAIS AFFICHER. La page lit Home Assistant
     #    directement : filtrer côté inventaire ne la protège pas. On lui donne
     #    donc la liste, calculée ici, où le Superviseur est connu.
-    interdits = sorted(entites_de_nos_modules(_SUP_POUR_CONFIG))
+    interdits = set(entites_de_nos_modules(_SUP_POUR_CONFIG))
+
+    # ⛔ ET CE QUE L'EXPLOITANT INTERDIT EN PLUS, LOGEMENT PAR LOGEMENT.
+    #      Le 03/08/2026, l'écran du voyageur affichait un interrupteur pour la
+    #      télévision du salon. L'allumer depuis Home Assistant fait apparaître
+    #      « Home Assistant » EN GRAND sur la télé — notre outil interne, sur
+    #    l'écran d'un client, dans son salon. Aucun réglage ne permettait de le
+    #    retirer : la liste d'exclusion ne contenait que nos propres modules,
+    #    calculés ici, et n'acceptait rien de la fiche.
+    #
+    #    Elle accepte maintenant. C'est à l'exploitant de décider ce qu'un
+    #    voyageur peut toucher — pas au hasard de ce que Home Assistant a
+    #    découvert dans le logement.
+    for e in (conf.get("exclure") or []):
+        if isinstance(e, str) and e.strip():
+            interdits.add(e.strip())
+
     if interdits:
-        conf["exclure"] = interdits
+        conf["exclure"] = sorted(interdits)
     return conf
 
 
@@ -2278,6 +2295,12 @@ def etat_pad(mot_de_passe=None):
         "isolee": False,
         "ip": p.ip,
         "batterie": info.get("batteryLevel"),
+        # ⚠️ TOUJOURS BRANCHÉE, DONC LA VALEUR ABSOLUE NE DIT RIEN. L'étude
+        #    énergie l'a établi : « tous les relevés branchés sont à 38–40 °C
+        #    quoi qu'affiche l'écran, le chargeur tient la température à lui
+        #    seul ». Un pad mural est branché en permanence : c'est la DÉRIVE
+        #    qui parle — par rapport à sa propre moyenne, ou aux autres du parc.
+        "temperature": info.get("batteryTemperature"),
         "branche": bool(info.get("isPlugged")),
         "ecran_allume": bool(info.get("screenOn")),
         "page": _remarquer_hub(info.get("currentPage"), mienne),
@@ -3255,6 +3278,41 @@ def _plomberie_ha(entity_id):
             or e.startswith(_PREFIXES_INTERNES))
 
 
+def temperature_machine():
+    """La température du processeur, lue sur le système.
+
+    ⚠️ ON LIT LA MACHINE, PAS CE QU'ELLE RACONTE. Home Assistant sait exposer
+       cette valeur (intégration « System Monitor »), mais il faudrait l'activer
+       sur chaque boîtier — et on perdrait la mesure au moment précis où elle
+       sert : quand Home Assistant va mal. Le noyau, lui, l'écrit toujours.
+
+    ⚠️ PLUSIEURS ZONES, ON GARDE LA PLUS CHAUDE. Une machine en expose souvent
+       trois ou quatre (processeur, carte, alimentation). Prendre la première
+       revient à tirer au sort ; prendre la plus chaude, c'est prendre celle qui
+       déclenchera la limitation.
+
+    Un boîtier qui chauffe RALENTIT avant de tomber : c'est un signal précoce,
+    au même titre que l'allongement du délai des ordres.
+    """
+    chaudes = []
+    try:
+        for zone in sorted(glob.glob("/sys/class/thermal/thermal_zone*/temp")):
+            try:
+                with open(zone, encoding="utf-8") as f:
+                    brut = int(f.read().strip())
+            except (OSError, ValueError):
+                continue
+            # Le noyau écrit des milli-degrés ; certaines cartes des degrés.
+            c = brut / 1000.0 if brut > 1000 else float(brut)
+            # ⛔ Une zone qui rend 0 ou une valeur absurde n'est pas une mesure.
+            #    La taire vaut mieux que d'afficher « 0 °C » sur un écran.
+            if 5.0 < c < 120.0:
+                chaudes.append(round(c, 1))
+    except Exception:
+        return None
+    return max(chaudes) if chaudes else None
+
+
 def instantane_sante(ha, sup=None, store=None):
     """Ce que le hub VOIT, à chaque contact.
 
@@ -3378,6 +3436,9 @@ def instantane_sante(ha, sup=None, store=None):
         # que tant qu'il croit le hub démuni, et le mot de passe suffisait à le
         # rassurer.
         snap["pad_maintenance"] = bool(_code_maintenance())
+        t = temperature_machine()
+        if t is not None:
+            snap["temperature"] = t
         # ⚠️ LA MESURE QUI MANQUAIT. Sans elle, impossible de savoir à distance
         #    pourquoi une mise à jour échoue — il a fallu lire le code, deviner,
         #    et essayer trois fois. Un booléen l'aurait dit tout de suite.
