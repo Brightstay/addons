@@ -2851,6 +2851,11 @@ def dispatch(cmd, ha, store, sup=None, version_ha=None, differes=None):
             "addons": {a.get("slug"): a.get("version") for a in addons},
         }
 
+    if t == "hub.mesures":
+        # Le serveur dit au hub s'il doit tenir une courbe fine. Voir
+        # `mesures_fines()` : c'est le palier du logement qui décide.
+        return "acked", poser_mesures_fines(bool(p.get("fines")))
+
     if t == "hub.logs":
         return lire_journal(sup, p.get("source"), p.get("lignes"))
 
@@ -3392,8 +3397,44 @@ def _plomberie_ha(entity_id):
 #    courbe que personne ne regardera. Les boîtiers d'essai, eux, sont là pour
 #    être regardés : c'est sur eux qu'on veut le détail.
 #    Ailleurs, l'instantané horaire suffit — il porte déjà la température.
-MESURES_FINES = os.environ.get("BS_MESURES_FINES", "").lower() in ("1", "true", "on", "oui")
 PERIODE_MESURE_S = 600
+
+
+def _fichier_mesures():
+    return os.path.join(PAD_RACINE, "mesures_fines")
+
+
+def mesures_fines():
+    """Ce hub enregistre-t-il une courbe fine ?
+
+    ⚠️ C'EST LE SERVEUR QUI SAIT, PAS LE HUB. Le palier — atelier, canari,
+       early, stable — vit dans la fiche du logement ; l'agent ne l'a jamais su
+       et n'a pas à le deviner. Le serveur le lui DIT, par une commande, et il
+       le garde sur disque : au redémarrage suivant il s'en souvient, sans avoir
+       à redemander.
+
+    ⚠️ ÉTEINT PAR DÉFAUT. 144 relevés par jour et par boîtier : sur cinq cents
+       kits, 72 000 lignes quotidiennes pour une courbe que personne n'ouvrira.
+       Les kits d'essai sont là pour être regardés ; les autres, pour tourner.
+    """
+    if os.environ.get("BS_MESURES_FINES", "").lower() in ("1", "true", "on", "oui"):
+        return True
+    try:
+        with open(_fichier_mesures(), encoding="utf-8") as f:
+            return f.read().strip() == "1"
+    except OSError:
+        return False
+
+
+def poser_mesures_fines(actif):
+    """Retenir la consigne du serveur, pour qu'elle survive au redémarrage."""
+    try:
+        os.makedirs(PAD_RACINE, exist_ok=True)
+        with open(_fichier_mesures(), "w", encoding="utf-8") as f:
+            f.write("1" if actif else "0")
+    except OSError as e:
+        print("[hub-agent] consigne de mesure non conservée :", e, flush=True)
+    return {"mesures_fines": bool(actif)}
 
 
 def temperature_machine():
@@ -3446,7 +3487,7 @@ def evenement_temperature(pad_temp=None):
     Rend `None` quand il n'y a rien à dire : pas de palier canari, pas de
     mesure, ou l'intervalle n'est pas écoulé.
     """
-    if not MESURES_FINES:
+    if not mesures_fines():
         return None
     maintenant = time.time()
     if maintenant - _DERNIERE_MESURE["quand"] < PERIODE_MESURE_S:
@@ -3597,6 +3638,7 @@ def instantane_sante(ha, sup=None, store=None):
         #    pourquoi une mise à jour échoue — il a fallu lire le code, deviner,
         #    et essayer trois fois. Un booléen l'aurait dit tout de suite.
         snap["ha_admin"] = getattr(ha, "admin", None) is not None
+        snap["mesures_fines"] = mesures_fines()
         pad = etat_pad()
         if pad is not None:
             snap["pad"] = pad
