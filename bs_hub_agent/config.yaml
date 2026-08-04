@@ -1,7 +1,7 @@
 # Manifeste de l'add-on — c'est ce que Home Assistant lit pour savoir quoi
 # installer, avec quels droits, et sous quel nom l'afficher.
 name: Brightstay Hub Agent
-version: "0.5.16"
+version: "0.5.17"
 slug: bs_hub_agent
 description: Relie le logement à Brightstay — remonte ce que voit le boîtier, applique ce qu'on lui demande, et sert la page de la tablette.
 url: https://github.com/Brightstay/addons/tree/main/bs_hub_agent

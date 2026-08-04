@@ -3583,7 +3583,39 @@ def main():
     ha = HA(ha_url, ha_token)
     # Le même Home Assistant, mais vu par un compte administrateur. Sert aux
     # gestes qu'un module n'a pas le droit de faire sur lui-même.
-    ha.admin = HA(ha_url, ha_token_pad) if ha_token_pad and ha_token_pad != ha_token else None
+    # ⛔ LE JETON D'UN UTILISATEUR NE VA PAS À L'ADRESSE DU SUPERVISEUR.
+    #    `ha_url` vaut « http://supervisor/core » : c'est le relais du
+    #    Superviseur, et il n'accepte QUE le jeton du Superviseur. Y envoyer un
+    #    jeton de compte administrateur donne un 403 — un code nu, sans un mot
+    #    d'explication.
+    #
+    #    Le 03 et le 04/08/2026, la mise à jour de l'agent a échoué SIX FOIS de
+    #    suite avec ce 403, alors que le jeton était bien posé et que
+    #    l'instantané affichait « ha_admin : oui ». On a cherché du côté des
+    #    droits, de la boutique, des règles du Superviseur. C'était l'adresse.
+    #
+    # ⚠️ C'EST L'ERREUR SYMÉTRIQUE DE CELLE DU 29/07, ET LE CODE LA DÉCRIT DÉJÀ
+    #    vingt lignes plus haut, pour la tablette : « le SUPERVISOR_TOKEN ouvre
+    #    le Superviseur ; Home Assistant, lui, le refuse. » On l'avait comprise
+    #    dans un sens, jamais dans l'autre.
+    #
+    #    Home Assistant s'atteint en direct : `homeassistant:8123` sur le réseau
+    #    des modules, `172.30.32.1:8123` en repli. Et on VÉRIFIE la porte avant
+    #    de s'en servir, plutôt que de découvrir son refus au pire moment.
+    ha.admin = None
+    if ha_token_pad and ha_token_pad != ha_token:
+        for direct in ("http://homeassistant:8123", "http://172.30.32.1:8123"):
+            essai = HA(direct, ha_token_pad)
+            try:
+                if essai.states():
+                    ha.admin = essai
+                    print("[hub-agent] compte administrateur joignable sur", direct, flush=True)
+                    break
+            except Exception as e:
+                print("[hub-agent] %s refuse le jeton admin : %s" % (direct, str(e)[:90]), flush=True)
+        if ha.admin is None:
+            print("[hub-agent] AUCUNE porte n'accepte le jeton d'administrateur — "
+                  "la mise à jour de l'agent échouera", flush=True)
     store = Store(config_dir)
     # Avant tout : que nos dossiers soient LUS. Sans ça, chaque `hub.apply`
     # écrira dans le vide en répondant « appliqué ».
