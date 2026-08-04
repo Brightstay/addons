@@ -330,6 +330,28 @@ class Supervisor:
                 client = admin or ha
                 entite = entite_de_mise_a_jour(client, fiche)
                 if entite:
+                    # ⛔ HOME ASSISTANT NE VOIT PAS LA NOUVELLE VERSION TOUT DE
+                    #    SUITE, ET ON NE L'ATTEND PAS : ON LE LUI ORDONNE.
+                    #
+                    #    Le Superviseur relit la boutique quand on le lui
+                    #    demande ; l'entité de mise à jour de Home Assistant,
+                    #    elle, se rafraîchit à SON rythme. Entre les deux, elle
+                    #    annonce « installée 0.5.17 → proposée 0.5.17 » alors
+                    #    que la 0.5.18 est publiée depuis dix minutes. Lui
+                    #    demander d'installer une version qu'elle ne voit pas
+                    #    rend 403 ou 500 selon l'humeur — c'est ce qui a fait
+                    #    échouer SEPT mises à jour les 03 et 04/08/2026, en
+                    #    donnant chaque fois un code différent et aucune piste.
+                    #
+                    #    `homeassistant.update_entity` force la relecture. Une
+                    #    seconde, et la version apparaît.
+                    try:
+                        client.call_service("homeassistant", "update_entity",
+                                            {"entity_id": entite})
+                        time.sleep(2)
+                    except Exception as e:
+                        print("[hub-agent] rafraîchissement de %s refusé : %s"
+                              % (entite, str(e)[:90]), flush=True)
                     # ⛔ ON ESSAIE, PUIS ON EXPLIQUE — on ne refuse pas d'avance.
                     #    Le 03/08, l'agent a rendu « HTTP Error 403: Forbidden »,
                     #    trois fois, sans jamais dire quoi faire. La cause la plus
@@ -337,6 +359,23 @@ class Supervisor:
                     #    dit AU MOMENT de l'échec, sans présumer qu'elle est la
                     #    seule — un refus d'avance interdirait des cas qui
                     #    marchent (un `ha` déjà administrateur, par exemple).
+                    # ⛔ LE SCRIPT D'ABORD, L'APPEL DIRECT EN SECOURS — ET PAS
+                    #    L'INVERSE. L'appel direct demande à Home Assistant de
+                    #    remplacer l'agent PENDANT que l'agent tient la
+                    #    connexion : le conteneur meurt au milieu de la requête,
+                    #    plus personne ne répond, et Home Assistant rend 500.
+                    #    Ce n'est pas un défaut de droits, c'est une branche
+                    #    coupée pendant qu'on est assis dessus.
+                    #    Le script, lui, découple : Home Assistant l'exécute
+                    #    pour son compte, et l'agent peut mourir tranquillement.
+                    try:
+                        ha.call_service("script", "turn_on",
+                                        {"entity_id": "script." + SCRIPT_SECOURS})
+                        return {"addon": vrai, "par": "script." + SCRIPT_SECOURS,
+                                "version": version or "celle de la boutique"}
+                    except Exception as e0:
+                        print("[hub-agent] script de secours indisponible (%s) — "
+                              "on tente l'appel direct" % str(e0)[:80], flush=True)
                     try:
                         client.call_service("update", "install", {"entity_id": entite})
                     except Exception as e:
