@@ -11,6 +11,9 @@ export BS_SYNC_INTERVAL="$(bashio::config 'sync_interval')"
 # l'agent doit démarrer quand même — il le dira dans son journal.
 export BS_PAD_HA_TOKEN="$(bashio::config 'ha_token' || true)"
 
+# Le relevé fin de température : palier canari seulement (voir config.yaml).
+export BS_MESURES_FINES="$(bashio::config 'mesures_fines' || echo false)"
+
 # L'adresse du serveur et la clé du logement viennent normalement de l'image
 # préparée en atelier, qui les pose dans l'environnement. Sur une installation
 # ordinaire — un boîtier d'essai, ou un hôte qui a déjà son Home Assistant —
