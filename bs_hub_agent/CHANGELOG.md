@@ -1,3 +1,12 @@
+## 0.6.6 — 2026-08-05
+
+- La passerelle Zigbee est surveillée. Une clé débranchée est signalée au lieu
+  d'être découverte le jour où plus rien ne s'allume ; une clé remplacée est
+  reconnue et la passerelle repointée dessus ; une passerelle arrêtée est
+  relancée.
+- Un coordinateur relié par le réseau n'est pas touché : il ne se déclare pas
+  par un port, et le croire perdu déferait une installation volontaire.
+
 ## 0.6.5 — 2026-08-05
 
 - La pose de la passerelle Zigbee attend que Home Assistant ait fini de

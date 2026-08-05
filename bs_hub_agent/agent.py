@@ -3188,10 +3188,16 @@ def ports_series(sup):
        répondait autre chose que ce qu'on croyait. Un refus qui ne dit pas ce
        qu'il a regardé oblige à publier une version pour le savoir.
     """
+    # ⛔ « JE N'AI PAS PU DEMANDER » N'EST PAS « IL N'Y A RIEN ». Les deux
+    #    rendaient une liste vide, et la surveillance se taisait sur une clé
+    #    débranchée parce qu'elle croyait la machine muette. On distingue :
+    #    `None` = la question n'a pas abouti, `[]` = la machine a répondu qu'il
+    #    n'y a aucun port. Le premier impose le silence, le second est une
+    #    information.
     try:
         rep = sup.materiel() or {}
     except Exception as e:
-        return [], str(e)[:120]
+        return None, str(e)[:120]
 
     # ⛔ ON DÉBALLAIT DEUX FOIS, ET LA MACHINE PASSAIT POUR VIDE.
     #    `Supervisor._req` retire déjà l'enveloppe `{result, data}` du
@@ -3245,7 +3251,7 @@ def port_zigbee(sup, connu_seulement=False):
     """
     vus, _ = ports_series(sup)
     connus, usb = [], []
-    for d in vus:
+    for d in vus or []:
         # Le chemin stable si on l'a, sinon celui qu'on a — mieux vaut un
         # `/dev/ttyUSB0` qui marche aujourd'hui que rien du tout.
         stable = d.get("stable") or d.get("chemin") or ""
@@ -3264,10 +3270,31 @@ def port_zigbee(sup, connu_seulement=False):
     return (connus or usb or [None])[0]
 
 
+# ⛔ UNE SEULE POSE À LA FOIS, ET LE VERROU EST ICI PLUTÔT QU'AUX DEUX APPELS.
+#    Deux chemins mènent à cette fonction : la veille automatique, qui tourne
+#    dans la boucle du boîtier, et l'ordre venu d'un écran, exécuté dans le même
+#    fil mais pas au même moment. Les faire se croiser, c'est deux installations
+#    du même module en parallèle — le Superviseur refuse la seconde, et le refus
+#    remonte à l'hôte comme une panne. Poser le verrou dans la fonction plutôt
+#    que chez ses appelants, c'est s'assurer qu'un troisième appelant, un jour,
+#    sera protégé sans qu'on y pense.
+_VERROU_ZIGBEE = threading.Lock()
+
+
 def poser_passerelle_zigbee(ha, sup):
     """Installe, règle et démarre ce qu'il faut pour appairer du Zigbee."""
     if sup is None:
         return "failed", {"error": "sans Superviseur, aucun module à poser"}
+
+    if not _VERROU_ZIGBEE.acquire(blocking=False):
+        return "failed", {"error": "une installation est déjà en cours sur ce boîtier"}
+    try:
+        return _poser_passerelle_zigbee(ha, sup)
+    finally:
+        _VERROU_ZIGBEE.release()
+
+
+def _poser_passerelle_zigbee(ha, sup):
 
     deja = pile_zigbee(ha)
     if deja:
@@ -3428,6 +3455,105 @@ def veiller_sur_la_cle_zigbee(ha, sup):
                         "detail": "clé Zigbee reconnue, passerelle en place"},
             "occurred_at": _now_iso(),
             "dedup_key": "zigbee-passerelle-posee"}
+
+
+# =====================================================================
+# SURVEILLER LA PASSERELLE — une clé qui s'en va ne prévient personne
+#
+# ⛔ CE QUI ARRIVE EN VRAI, ET QUE PERSONNE NE VOIT. L'hôte débranche la clé
+#    pour brancher autre chose, ou la remplace par un modèle plus récent. Le
+#    module reste installé, donc la pose automatique ne se déclenche pas : elle
+#    ne regarde que « y a-t-il une passerelle ». Zigbee2MQTT, lui, cherche un
+#    port qui n'existe plus, s'arrête, et le logement perd tous ses appareils
+#    Zigbee. Sans surveillance, l'hôte l'apprend le jour où un voyageur se
+#    plaint que rien ne s'allume.
+#
+# ⚠️ ON NE TOUCHE PAS À UNE PASSERELLE QU'ON N'A PAS POSÉE. Un coordinateur
+#    relié par le réseau se déclare par une adresse, pas par un `/dev/…` : son
+#    port n'apparaîtra jamais dans la liste des ports série, et le croire perdu
+#    ferait défaire l'installation de quelqu'un qui savait ce qu'il faisait.
+# =====================================================================
+PERIODE_SURVEILLANCE = 15 * 60
+_SURVEILLANCE = {"vue_le": 0.0, "echecs": 0, "dernier": None}
+
+
+def surveiller_passerelle(ha, sup):
+    """La passerelle est-elle toujours en état ? Rend un événement, ou None."""
+    if sup is None:
+        return None
+    if time.monotonic() - _SURVEILLANCE["vue_le"] < PERIODE_SURVEILLANCE:
+        return None
+    _SURVEILLANCE["vue_le"] = time.monotonic()
+
+    try:
+        fiche = sup._req("GET", "/addons/%s/info" % ZIGBEE2MQTT) or {}
+    except Exception:
+        return None                      # pas installée : rien à surveiller
+    fiche = fiche.get("data") if isinstance(fiche.get("data"), dict) else fiche
+    if not fiche.get("version"):
+        return None
+
+    configure = ((fiche.get("options") or {}).get("serial") or {}).get("port") or ""
+    etat = fiche.get("state")
+
+    # Un coordinateur sur le réseau ne se juge pas à la liste des ports série.
+    if configure and not configure.startswith("/dev/"):
+        return _dire_surveillance("reseau", etat, None)
+
+    vus, souci = ports_series(sup)
+    if vus is None:
+        return None                      # la machine n'a pas répondu : on se tait
+    chemins = {c for d in vus for c in (d.get("stable"), d.get("chemin")) if c}
+    presente = configure in chemins if configure else False
+
+    if presente and etat == "started":
+        return _dire_surveillance("ok", etat, configure)
+
+    if presente and etat != "started":
+        # Arrêtée alors que sa clé est là : on la relance, une fois par tour de
+        # surveillance, et on le dit si ça ne suffit pas.
+        try:
+            sup.demarrer_addon(ZIGBEE2MQTT)
+            return _dire_surveillance("relancee", etat, configure)
+        except Exception as e:
+            return _dire_surveillance("bloquee", str(e)[:120], configure)
+
+    # Le port configuré a disparu. Une autre radio est-elle branchée ?
+    remplacante = port_zigbee(sup, connu_seulement=True)
+    if remplacante and remplacante != configure:
+        # ⛔ LA CLÉ A ÉTÉ REMPLACÉE. On la reconfigure : garder l'ancien chemin,
+        #    c'est laisser une passerelle morte avec une clé neuve à côté.
+        try:
+            sup.regler_addon(ZIGBEE2MQTT, {
+                "serial": {"port": remplacante, "adapter": _adaptateur_de(remplacante)}})
+            sup.demarrer_addon(ZIGBEE2MQTT)
+            return _dire_surveillance("remplacee", etat, remplacante)
+        except Exception as e:
+            return _dire_surveillance("bloquee", str(e)[:120], remplacante)
+
+    return _dire_surveillance("cle_absente", etat, configure)
+
+
+def _dire_surveillance(cas, etat, port):
+    """Une ligne par CHANGEMENT d'état, pas une par tour de surveillance."""
+    if _SURVEILLANCE["dernier"] == cas:
+        return None
+    _SURVEILLANCE["dernier"] = cas
+    if cas in ("ok", "reseau"):
+        return None                      # la normale ne s'écrit pas
+    phrases = {
+        "relancee": ("info", "passerelle Zigbee arrêtée, relancée"),
+        "remplacee": ("info", "nouvelle clé Zigbee reconnue, passerelle reconfigurée"),
+        "cle_absente": ("warning", "la clé Zigbee ne répond plus : les appareils "
+                                   "du logement ne sont plus pilotables"),
+        "bloquee": ("warning", "la passerelle Zigbee ne repart pas"),
+    }
+    gravite, phrase = phrases.get(cas, ("warning", "passerelle Zigbee : %s" % cas))
+    return {"type": "zigbee", "severity": gravite,
+            "payload": {"operation": "passerelle", "phase": "surveillance",
+                        "detail": phrase, "port": port, "etat": etat},
+            "occurred_at": _now_iso(),
+            "dedup_key": "zigbee-surveillance-%s" % cas}
 
 
 def _confirmer_mqtt(ha):
@@ -4988,6 +5114,11 @@ def main():
             #    Assistant. Le boîtier voit la clé apparaître et fait le reste.
             try:
                 evt = veiller_sur_la_cle_zigbee(ha, sup)
+                if evt:
+                    evenements.append(evt)
+                # Et une fois posée, on la surveille : une clé débranchée ou
+                # remplacée laisse une passerelle morte que rien ne signale.
+                evt = surveiller_passerelle(ha, sup)
                 if evt:
                     evenements.append(evt)
             except Exception as e:
