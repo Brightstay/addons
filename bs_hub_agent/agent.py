@@ -712,6 +712,58 @@ class Supervisor:
         self._req("POST", "/host/reboot", {}, timeout=60)
         return {"hote": "redémarrage demandé"}
 
+    # -----------------------------------------------------------------
+    # POSER UN MODULE — pour que l'hôte n'ait pas à le faire
+    #
+    # ⛔ BORNÉ À CEUX DU KIT, ET C'EST LA MÊME RÈGLE QU'HIER. Installer un
+    #    module quelconque à distance, c'est faire tourner du code d'un tiers
+    #    sur la machine d'un client. La liste est courte, elle est ici, et elle
+    #    ne se passe pas en paramètre.
+    # -----------------------------------------------------------------
+    MODULES_POSABLES = {
+        "core_mosquitto": "Mosquitto broker",
+        "45df7312_zigbee2mqtt": "Zigbee2MQTT",
+    }
+
+    def poser_addon(self, slug):
+        """Installe le module s'il manque, et le démarre. Idempotent."""
+        if slug not in self.MODULES_POSABLES:
+            raise ValueError("module hors du périmètre Brightstay : %s" % slug)
+        deja = None
+        try:
+            deja = self._req("GET", "/addons/%s/info" % slug)
+        except Exception:
+            deja = None
+        pose = bool(deja and (deja.get("data") or deja).get("version"))
+        if not pose:
+            # La boutique d'abord : sur un boîtier qui n'a jamais rien installé,
+            # le dépôt communautaire n'est pas encore lu, et l'installation
+            # échoue sur un « inconnu » qui ne dit pas qu'il suffisait d'attendre.
+            try:
+                self.recharger_boutique()
+            except Exception:
+                pass
+            self._req("POST", "/store/addons/%s/install" % slug, {}, timeout=1800)
+        return {"slug": slug, "deja_pose": pose}
+
+    def regler_addon(self, slug, options):
+        if slug not in self.MODULES_POSABLES:
+            raise ValueError("module hors du périmètre Brightstay : %s" % slug)
+        self._req("POST", "/addons/%s/options" % slug, {"options": options}, timeout=120)
+        return {"slug": slug, "regle": True}
+
+    def demarrer_addon(self, slug):
+        if slug not in self.MODULES_POSABLES:
+            raise ValueError("module hors du périmètre Brightstay : %s" % slug)
+        etat = ((self._req("GET", "/addons/%s/info" % slug) or {}).get("data") or {}).get("state")
+        if etat != "started":
+            self._req("POST", "/addons/%s/start" % slug, {}, timeout=600)
+        return {"slug": slug, "demarre": True}
+
+    def materiel(self):
+        """Ce qui est branché sur la machine — ports série compris."""
+        return self._req("GET", "/hardware/info")
+
 
 # =====================================================================
 # LE HUB SERT LA PAGE DU PAD.
@@ -2972,6 +3024,130 @@ def ouvrir_appairage(ha, duree=None):
     return "acked", {"pile": pile, "duree_s": secondes}
 
 
+# =====================================================================
+# POSER LA PASSERELLE ZIGBEE — pour que l'hôte n'ait rien à installer
+#
+# ⛔ « BRANCHEZ LA CLÉ » NE SUFFIT PAS, ET C'EST LE PIÈGE. Une clé Zigbee est
+#    un bout de silicium tant que rien ne la pilote : il faut un facteur
+#    (Mosquitto) et un traducteur (Zigbee2MQTT), tous deux à installer dans
+#    Home Assistant, puis à régler avec le bon port et le bon adaptateur. Or
+#    l'hôte n'a pas accès à Home Assistant. Lui demander de le faire, c'est
+#    l'envoyer là où on a décidé qu'il n'irait pas.
+#
+# ⚠️ LE PORT NE SE DEVINE PAS DE MÉMOIRE. `/dev/ttyACM0` change de numéro d'un
+#    redémarrage à l'autre, selon ce qui a été branché avant. On demande donc à
+#    la machine son chemin stable (`/dev/serial/by-id/…`), celui qui désigne la
+#    clé et pas la place qu'elle occupait ce jour-là.
+#
+# ⚠️ ET L'ADAPTATEUR N'EST PAS LE MÊME SELON LA CLÉ. Le ZBDongle-E porte une
+#    puce Silicon Labs et veut `ember` ; le -P, une puce Texas Instruments et
+#    veut `zstack`. Le mauvais choix donne une passerelle qui démarre, semble
+#    saine, et ne voit jamais un seul appareil.
+# =====================================================================
+MOSQUITTO = "core_mosquitto"
+ZIGBEE2MQTT = "45df7312_zigbee2mqtt"
+
+
+def _adaptateur_de(chemin):
+    """Quelle pile de radio pour cette clé, d'après son nom de port."""
+    c = (chemin or "").lower()
+    if "silicon_labs" in c or "zbdongle-e" in c or "cp210" in c and "sonoff" in c:
+        return "ember"
+    if "texas" in c or "zbdongle-p" in c or "cc2652" in c or "slab_usbtouart" in c:
+        return "zstack"
+    if "conbee" in c or "deconz" in c:
+        return "deconz"
+    # Inconnue : `ember` est le cas le plus fréquent dans notre kit, et un
+    # mauvais choix se voit tout de suite (aucun appareil ne répond).
+    return "ember"
+
+
+def port_zigbee(sup):
+    """Le chemin stable de la clé Zigbee branchée, ou None."""
+    try:
+        infos = (sup.materiel() or {}).get("data") or {}
+    except Exception:
+        return None
+    candidats = []
+    for d in infos.get("devices") or []:
+        if d.get("subsystem") != "tty":
+            continue
+        for chemin in d.get("by_id") and [d["by_id"]] or []:
+            c = chemin.lower()
+            # ⛔ On écarte ce qui n'est pas une radio : un boîtier peut porter
+            #    un modem, un onduleur, un lecteur de carte.
+            if any(m in c for m in ("zigbee", "zbdongle", "sonoff", "silicon_labs",
+                                    "cc2652", "conbee", "slab_usbtouart", "cp2102")):
+                candidats.append(chemin)
+    return candidats[0] if candidats else None
+
+
+def poser_passerelle_zigbee(ha, sup):
+    """Installe, règle et démarre ce qu'il faut pour appairer du Zigbee."""
+    if sup is None:
+        return "failed", {"error": "sans Superviseur, aucun module à poser"}
+
+    deja = pile_zigbee(ha)
+    if deja:
+        return "acked", {"deja": deja, "note": "une passerelle est déjà en place"}
+
+    port = port_zigbee(sup)
+    if not port:
+        return "failed", {"error":
+            "aucune clé Zigbee reconnue sur la machine : vérifiez qu'elle est "
+            "branchée, si possible sur une rallonge USB"}
+
+    fait = []
+    # 1. Le facteur.
+    fait.append(sup.poser_addon(MOSQUITTO))
+    sup.demarrer_addon(MOSQUITTO)
+
+    # 2. Le traducteur, réglé sur LA clé trouvée.
+    fait.append(sup.poser_addon(ZIGBEE2MQTT))
+    adaptateur = _adaptateur_de(port)
+    sup.regler_addon(ZIGBEE2MQTT, {
+        "data_path": "/config/zigbee2mqtt",
+        "serial": {"port": port, "adapter": adaptateur},
+    })
+    sup.demarrer_addon(ZIGBEE2MQTT)
+
+    # 3. Le lien entre Home Assistant et le facteur. Home Assistant repère le
+    #    module tout seul et propose de le brancher : il reste à dire oui.
+    lien = _confirmer_mqtt(ha)
+
+    try:
+        journal_evenement("zigbee", "info",
+                          {"operation": "passerelle", "port": port,
+                           "adaptateur": adaptateur, "mqtt": lien})
+    except Exception:
+        pass
+    return "acked", {"port": port, "adaptateur": adaptateur,
+                     "modules": fait, "mqtt": lien}
+
+
+def _confirmer_mqtt(ha, essais=6):
+    """Accepte la proposition de branchement MQTT de Home Assistant.
+
+    ⚠️ ELLE N'ARRIVE PAS TOUT DE SUITE. Home Assistant repère le module une
+       fois qu'il tourne : on regarde plusieurs fois plutôt qu'une, sinon on
+       conclut « pas de proposition » alors qu'elle arrive deux secondes après.
+    """
+    for _ in range(essais):
+        try:
+            flux = ha._req("GET", "/api/config/config_entries/flow") or []
+        except Exception:
+            flux = []
+        for f in flux if isinstance(flux, list) else []:
+            if f.get("handler") == "mqtt":
+                try:
+                    ha._req("POST", "/api/config/config_entries/flow/%s" % f.get("flow_id"), {})
+                    return "branché"
+                except Exception as e:
+                    return "à confirmer dans Home Assistant (%s)" % str(e)[:60]
+        time.sleep(5)
+    return "aucune proposition vue — à brancher à la main si l'appairage échoue"
+
+
 def dispatch(cmd, ha, store, sup=None, version_ha=None, differes=None):
     t = cmd.get("type")
     p = cmd.get("payload") or {}
@@ -3060,6 +3236,12 @@ def dispatch(cmd, ha, store, sup=None, version_ha=None, differes=None):
                 "service refusé par le boîtier : %s.%s" % (domaine, service)}
         ha.call_service(domaine, service, p.get("data"))
         return "acked", {"called": domaine + "." + service}
+
+    if t == "hub.zigbee.installer":
+        pret, raison = ha_pret(ha)
+        if not pret:
+            return "failed", {"error": raison}
+        return poser_passerelle_zigbee(ha, sup)
 
     if t == "hub.zigbee.appairage":
         pret, raison = ha_pret(ha)

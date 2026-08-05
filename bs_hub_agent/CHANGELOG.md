@@ -1,3 +1,10 @@
+## 0.5.23 — 2026-08-05
+
+- Le boîtier sait poser lui-même sa passerelle Zigbee : il reconnaît la clé
+  branchée, installe ce qu'il faut, choisit l'adaptateur correspondant à sa
+  puce et démarre le tout. Brancher la clé suffit désormais.
+- Il n'installe que les deux modules du kit, et rien d'autre.
+
 ## 0.5.22 — 2026-08-05
 
 - L'hôte peut ajouter un appareil Zigbee depuis son espace, sans passer par
