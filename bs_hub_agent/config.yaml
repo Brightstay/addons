@@ -1,7 +1,7 @@
 # Manifeste de l'add-on — c'est ce que Home Assistant lit pour savoir quoi
 # installer, avec quels droits, et sous quel nom l'afficher.
 name: Brightstay Hub Agent
-version: "0.5.24"
+version: "0.6.0"
 slug: bs_hub_agent
 description: Relie le logement à Brightstay — remonte ce que voit le boîtier, applique ce qu'on lui demande, et sert la page de la tablette.
 url: https://github.com/Brightstay/addons/tree/main/bs_hub_agent
@@ -48,6 +48,7 @@ options:
   hub_sync_url: ""
   hub_key: ""
   ha_token: ""
+  backup_password: ""
   mesures_fines: false
 schema:
   sync_interval: int(30,3600)
@@ -69,12 +70,31 @@ schema:
   # À l'atelier : Home Assistant → profil → tout en bas → « jetons d'accès de
   # longue durée » → créer, puis coller ici.
   ha_token: "password?"
+  # LE MOT DE PASSE QUI CHIFFRE LES ARCHIVES DE CE LOGEMENT.
+  #
+  # ⛔ IL A MANQUÉ PENDANT DES SEMAINES SANS QUE ÇA SE VOIE. L'agent le lisait
+  # (`BS_BACKUP_PASSWORD`), et RIEN ne le posait : ni l'image d'atelier, ni ces
+  # options, ni le script de mise en route. Le code avait l'air prudent —
+  # « chiffre si un mot de passe est fourni » — et n'en recevait jamais. Toutes
+  # les sauvegardes prises jusqu'au 05/08/2026 sont donc en clair, avec dedans
+  # les jetons, le Wi-Fi de l'hôte et notre propre clé de hub.
+  #
+  # Posé à l'atelier, tiré au sort par boîtier, et gardé chez nous : une
+  # archive dont on n'a pas la clé ne se restaure pas, donc n'est pas une
+  # sauvegarde. Sans lui, la copie hors du logement REFUSE de partir.
+  backup_password: "password?"
   # ⚠️ RÉSERVÉ AUX KITS D'ESSAI. Un relevé de température toutes les trente
   # minutes fait 48 lignes par jour et par boîtier ; sur un parc de cinq
   # cents kits, 24 000 lignes par jour pour une courbe que personne ne
   # regardera. L'instantané horaire suffit partout ailleurs.
   mesures_fines: "bool?"
 
-# Les autres accès du boîtier — mot de passe de sauvegarde, certificat, mot de
-# passe de la tablette — restent posés par l'image d'atelier et n'apparaissent
-# pas ici : ce sont des secrets de mise en service, pas des réglages.
+# Les autres accès du boîtier — certificat, mot de passe de la tablette —
+# restent posés par l'image d'atelier et n'apparaissent pas ici : ce sont des
+# secrets de mise en service, pas des réglages.
+#
+# ⚠️ Le mot de passe des sauvegardes, lui, est DESCENDU ici le 05/08/2026. Il
+# était censé venir de l'image, comme les autres ; sauf que l'image ne le
+# posait pas, et personne ne s'en apercevait puisque l'agent chiffrait
+# « si un mot de passe est fourni ». Une option visible se remarque quand elle
+# est vide ; un secret qu'on croit posé ailleurs, non.

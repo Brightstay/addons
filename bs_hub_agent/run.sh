@@ -11,6 +11,14 @@ export BS_SYNC_INTERVAL="$(bashio::config 'sync_interval')"
 # l'agent doit démarrer quand même — il le dira dans son journal.
 export BS_PAD_HA_TOKEN="$(bashio::config 'ha_token' || true)"
 
+# LE MOT DE PASSE DES SAUVEGARDES. Même règle que la clé de hub : ce que
+# l'image d'atelier a posé dans l'environnement gagne, les options servent aux
+# boîtiers installés autrement. `|| true` : un boîtier plus ancien que cette
+# option doit démarrer quand même — il le dira au moment d'envoyer.
+if [ -z "${BS_BACKUP_PASSWORD:-}" ] && bashio::config.has_value 'backup_password'; then
+    export BS_BACKUP_PASSWORD="$(bashio::config 'backup_password' || true)"
+fi
+
 # Le relevé fin de température : palier canari seulement (voir config.yaml).
 export BS_MESURES_FINES="$(bashio::config 'mesures_fines' || echo false)"
 

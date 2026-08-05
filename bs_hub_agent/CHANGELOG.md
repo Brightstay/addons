@@ -1,3 +1,7 @@
+## 0.6.0 — 2026-08-05
+
+- À DÉCRIRE : ce que cette version change pour un hôte.
+
 ## 0.5.24 — 2026-08-05
 
 - Quand le boîtier ne trouve pas de clé Zigbee, il dit maintenant quels ports

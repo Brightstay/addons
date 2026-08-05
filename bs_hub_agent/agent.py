@@ -695,6 +695,63 @@ class Supervisor:
         r = self._req("POST", "/backups/new/full", corps, timeout=1800)
         return {"sauvegarde": (r or {}).get("slug"), "nom": nom, "chiffree": bool(mot_de_passe)}
 
+    def creer_sauvegarde_partielle(self, nom, mot_de_passe, addons=None):
+        """L'ARCHIVE QUI SORT DU LOGEMENT — la mémoire, pas l'historique.
+
+        ⚠️ CE N'EST PAS UNE PETITE SAUVEGARDE COMPLÈTE. Ce qui pèse dans une
+        archive complète, ce sont les mesures : la courbe de température du
+        salon depuis six mois. Cet historique ne sert à RIEN pour remonter un
+        logement — et il ferait passer des centaines de méga-octets sur la
+        ligne de l'hôte. On l'écarte explicitement (`exclude_database`).
+
+        ⭐ ET ON NOMME LES MODULES DONT LES DONNÉES SONT LA MÉMOIRE DU
+        LOGEMENT — au premier rang la passerelle Zigbee, dont le dossier
+        CONTIENT l'appairage des vingt appareils. C'était l'inconnue du plan :
+        « une archive complète emporte-t-elle l'appairage ? ». En le nommant,
+        la question ne se pose plus.
+
+        ⛔ SANS MOT DE PASSE, ON NE FABRIQUE RIEN. Une archive de Home
+        Assistant porte les jetons, le mot de passe du Wi-Fi de l'hôte, les
+        clés de ses intégrations — et notre propre clé de hub. En clair dans
+        un stockage, même privé, ce serait le butin. Le serveur refuse déjà
+        de la recevoir ; on refuse aussi de la produire, pour qu'elle n'existe
+        jamais sur le disque.
+        """
+        if not mot_de_passe:
+            raise ValueError("aucun mot de passe de sauvegarde sur ce boîtier : "
+                             "une archive en clair ne sort pas du logement")
+        corps = {
+            "name": nom,
+            "password": mot_de_passe,
+            "homeassistant": True,
+            "homeassistant_exclude_database": True,
+        }
+        if addons:
+            corps["addons"] = list(addons)
+        r = self._req("POST", "/backups/new/partial", corps, timeout=1800)
+        return {"sauvegarde": (r or {}).get("slug"), "nom": nom,
+                "chiffree": True, "addons": list(addons or [])}
+
+    def supprimer_sauvegarde(self, slug):
+        """Effacer une archive du boîtier.
+
+        ⚠️ SANS ÇA, LE REMÈDE DEVIENT LA MALADIE. L'archive partielle n'existe
+        que pour être envoyée ; la laisser sur place ferait grossir le disque
+        chaque semaine, jusqu'à déclencher l'alerte disque du boîtier — une
+        alerte causée par le mécanisme censé le protéger."""
+        self._req("DELETE", "/backups/%s" % slug, timeout=120)
+        return {"efface": slug}
+
+    def flux_sauvegarde(self, slug, timeout=1800):
+        """Le contenu de l'archive, en flux — jamais chargé en mémoire.
+
+        Un boîtier a 2 à 4 Go de mémoire vive et fait tourner tout le logement
+        dessus. On lit par blocs et on écrit au fur et à mesure."""
+        req = urllib.request.Request(self.base + "/backups/%s/download" % slug,
+                                     method="GET")
+        req.add_header("Authorization", "Bearer " + self.token)
+        return urllib.request.urlopen(req, timeout=timeout)
+
     def info_host(self):
         return self._req("GET", "/host/info")
 
@@ -3076,16 +3133,49 @@ def ports_series(sup):
        qu'il a regardé oblige à publier une version pour le savoir.
     """
     try:
-        infos = (sup.materiel() or {}).get("data") or {}
+        rep = sup.materiel() or {}
     except Exception as e:
         return [], str(e)[:120]
+
+    # ⛔ ON DÉBALLAIT DEUX FOIS, ET LA MACHINE PASSAIT POUR VIDE.
+    #    `Supervisor._req` retire déjà l'enveloppe `{result, data}` du
+    #    Superviseur ; redemander `data` par-dessus rendait un dictionnaire
+    #    vide, toujours. Le boîtier répondait donc « aucun port série » à un
+    #    hôte dont la clé était parfaitement branchée. Vérifié sur le vrai
+    #    boîtier le 05/08/2026 : le Superviseur voyait `/dev/ttyUSB0` et son
+    #    chemin stable, nous ne voyions rien.
+    #    On accepte les deux formes plutôt que de parier sur l'une.
+    infos = rep.get("data") if isinstance(rep.get("data"), dict) else rep
+
     vus = []
+    # Format récent : une liste d'appareils, chacun avec son sous-système.
     for d in infos.get("devices") or []:
         if d.get("subsystem") != "tty":
             continue
         vus.append({"nom": d.get("name"), "chemin": d.get("dev_path"),
                     "stable": d.get("by_id")})
-    return vus, None
+
+    # ⚠️ ET LE FORMAT ANCIEN, QUI N'A PAS DISPARU. Le Superviseur a longtemps
+    #    rendu `{"serial": ["/dev/ttyUSB0", "/dev/serial/by-id/…"]}` — une
+    #    simple liste de chemins, sans sous-système. Ne lire que la forme
+    #    récente donne « aucun port série » sur une machine qui en a : le
+    #    refus accusait alors le matériel de l'hôte pour un défaut de lecture.
+    for chemin in infos.get("serial") or []:
+        if not isinstance(chemin, str):
+            continue
+        stable = chemin if "by-id" in chemin else None
+        deja = next((v for v in vus if v.get("chemin") == chemin
+                     or v.get("stable") == chemin), None)
+        if deja:
+            if stable and not deja.get("stable"):
+                deja["stable"] = stable
+            continue
+        vus.append({"nom": chemin.rsplit("/", 1)[-1],
+                    "chemin": None if stable else chemin, "stable": stable})
+
+    # Rien trouvé : on rend les clés de la réponse. C'est ce qui permet de
+    # savoir si la machine est vide ou si l'on a mal lu.
+    return vus, (None if vus else "réponse du Superviseur : %s" % sorted(infos.keys()))
 
 
 def port_zigbee(sup):
@@ -3093,11 +3183,13 @@ def port_zigbee(sup):
     vus, _ = ports_series(sup)
     connus, usb = [], []
     for d in vus:
-        stable = d.get("stable") or ""
+        # Le chemin stable si on l'a, sinon celui qu'on a — mieux vaut un
+        # `/dev/ttyUSB0` qui marche aujourd'hui que rien du tout.
+        stable = d.get("stable") or d.get("chemin") or ""
         c = stable.lower()
         if any(m in c for m in RADIOS_CONNUES):
             connus.append(stable)
-        elif "usb-" in c:
+        elif "usb-" in c or "ttyusb" in c or "ttyacm" in c:
             # ⚠️ UNE RADIO QU'ON NE CONNAÎT PAS RESTE UNE RADIO. Les noms de
             #    clés changent à chaque révision ; refuser tout ce qui n'est
             #    pas dans notre liste ferait échouer le kit suivant. Un port
@@ -3352,6 +3444,14 @@ def dispatch(cmd, ha, store, sup=None, version_ha=None, differes=None):
                          lambda: sup.creer_sauvegarde(nom, mdp),
                          "sauvegarde complète « %s »" % nom)
 
+    if t == "hub.backup.envoyer":
+        # Long : fabriquer l'archive puis la pousser prend des minutes. On
+        # acquitte d'abord, sinon le serveur re-livrerait l'ordre pendant que
+        # l'envoi est encore en cours — et le boîtier enverrait deux fois.
+        return _differer(differes, "backup.envoyer",
+                         lambda: envoyer_sauvegarde(sup, p.get("nom")),
+                         "copie de sauvegarde hors du logement")
+
     if t == "hub.backup.list":
         return "acked", sup.liste_sauvegardes()
 
@@ -3573,6 +3673,162 @@ def adresse_signee_du_paquet(version, timeout=20):
         # adresse donnerait l'illusion que le seau privé fonctionne.
         print("[hub-agent] adresse de paquet non obtenue pour", version, ":", e, flush=True)
         return None
+
+
+# =====================================================================
+# LA COPIE QUI SORT DU LOGEMENT
+#
+# ⛔ LE TROU QUE ÇA COMBLE. Le boîtier sauvegardait déjà — une archive
+#    complète chaque nuit, trois copies gardées, une alerte au bout de 48 h
+#    sans rien. Tout cela marchait. Et tout cela était posé SUR LE DISQUE DE
+#    LA MACHINE dont la sauvegarde est censée nous protéger. On était donc
+#    couverts contre le logiciel, pas contre le matériel — alors que c'est la
+#    panne matérielle qui impose un déplacement chez l'hôte.
+#
+# ⚠️ DEUX LECTURES, AUCUNE COPIE SUR LE DISQUE. On lit l'archive une première
+#    fois pour connaître sa taille exacte et son empreinte, une seconde pour
+#    l'envoyer. On serait tenté de n'en faire qu'une, en la posant dans un
+#    fichier temporaire : ce serait écrire quelques méga-octets de plus sur la
+#    carte mémoire à chaque envoi, c'est-à-dire user précisément la pièce
+#    qu'on cherche à pouvoir remplacer. La relecture est locale et gratuite ;
+#    l'écriture, non.
+#
+# ⚠️ ET L'ARCHIVE PARTIELLE EST EFFACÉE APRÈS COUP. Elle n'existe que pour être
+#    envoyée. La laisser sur place ferait grossir le disque chaque semaine
+#    jusqu'à déclencher l'alerte disque du boîtier — une alerte causée par le
+#    mécanisme censé le protéger.
+# =====================================================================
+SAUV_MAX_OCTETS = 256 * 1024 * 1024     # la même borne que le seau, côté serveur
+
+# Les modules dont le DOSSIER DE DONNÉES est la mémoire du logement, et sans
+# lesquels un boîtier de rechange repart vierge. On les reconnaît par des
+# morceaux de nom : le préfixe d'un add-on change d'un dépôt à l'autre
+# (`45df7312_zigbee2mqtt` ici, autre chose ailleurs), le nom, non.
+MORCEAUX_MEMOIRE = ("zigbee2mqtt", "z2m", "deconz", "zha", "mosquitto")
+
+
+def modules_a_sauver(sup):
+    """Les add-ons installés dont les données doivent partir avec l'archive."""
+    try:
+        liste = (sup.info_addons() or {}).get("addons") or []
+    except Exception:
+        return []
+    gardes = []
+    for a in liste:
+        slug = str((a or {}).get("slug") or "")
+        if any(m in slug.lower() for m in MORCEAUX_MEMOIRE):
+            gardes.append(slug)
+    return gardes
+
+
+def _url_fonction(nom):
+    """`…/functions/v1/hub-sync` → `…/functions/v1/<nom>` — même projet."""
+    base = os.environ.get("BS_HUB_SYNC_URL", "")
+    if not base:
+        return None
+    return base.rsplit("/", 1)[0] + "/" + nom
+
+
+def _poster_au_serveur(url, corps, timeout=60):
+    cle = os.environ.get("BS_HUB_KEY", "")
+    req = urllib.request.Request(url, data=json.dumps(corps).encode(), method="POST")
+    req.add_header("x-hub-key", cle)
+    req.add_header("Content-Type", "application/json")
+    with urllib.request.urlopen(req, timeout=timeout) as r:
+        txt = r.read().decode()
+        return json.loads(txt) if txt else {}
+
+
+def _mesurer_archive(sup, slug):
+    """Taille exacte et empreinte, sans rien garder. Première des deux passes."""
+    h = hashlib.sha256()
+    octets = 0
+    with sup.flux_sauvegarde(slug) as flux:
+        while True:
+            bloc = flux.read(65536)
+            if not bloc:
+                break
+            octets += len(bloc)
+            if octets > SAUV_MAX_OCTETS:
+                # Presque toujours la base de données revenue par la fenêtre.
+                # On s'arrête là plutôt que d'occuper la ligne de l'hôte.
+                raise ValueError("archive trop grosse (> %d octets) : la base de "
+                                 "données est-elle bien exclue ?" % SAUV_MAX_OCTETS)
+            h.update(bloc)
+    return octets, h.hexdigest()
+
+
+def envoyer_sauvegarde(sup, nom=None):
+    """Fabrique l'archive partielle, la dépose hors du logement, l'efface.
+
+    Rend un compte rendu, ou lève. Chaque étape est bavarde dans le journal :
+    quand ça rate, il faut pouvoir dire LAQUELLE a raté sans se déplacer."""
+    url_fn = _url_fonction("sauvegarde")
+    if not url_fn or not os.environ.get("BS_HUB_KEY"):
+        raise ValueError("ce boîtier ne sait pas à qui envoyer : "
+                         "adresse du serveur ou clé de hub manquante")
+
+    mdp = os.environ.get("BS_BACKUP_PASSWORD") or None
+    modules = modules_a_sauver(sup)
+    nom = nom or ("brightstay-hors-site-" + _now_iso())
+
+    faite = sup.creer_sauvegarde_partielle(nom, mdp, modules)
+    slug = faite.get("sauvegarde")
+    if not slug:
+        raise ValueError("le Superviseur n'a pas rendu de numéro d'archive")
+    print("[hub-agent] archive partielle %s créée (modules : %s)"
+          % (slug, ", ".join(modules) or "aucun"), flush=True)
+
+    try:
+        octets, empreinte = _mesurer_archive(sup, slug)
+
+        # ⚠️ LE SERVEUR DÉCIDE, PAS NOUS. Taille, chiffrement, logement coupé,
+        # boîtier sorti du parc : la serrure est là-bas. Ici on demande.
+        rep = _poster_au_serveur(url_fn, {
+            "etape": "demander",
+            "slug": slug,
+            "octets": octets,
+            "chiffree": True,
+        })
+        url_depot = rep.get("url")
+        chemin = rep.get("chemin")
+        if not url_depot or not chemin:
+            raise ValueError("dépôt refusé par le serveur")
+
+        # Deuxième passe : on relit l'archive et on la pousse telle quelle.
+        with sup.flux_sauvegarde(slug) as flux:
+            req = urllib.request.Request(url_depot, data=flux, method="PUT")
+            req.add_header("Content-Type", "application/x-tar")
+            req.add_header("Content-Length", str(octets))
+            req.add_header("x-upsert", "true")
+            with urllib.request.urlopen(req, timeout=1800) as r:
+                r.read()
+
+        # ⚠️ C'EST LE SERVEUR QUI CONSTATE. Il va vérifier que l'objet est bien
+        # là et de la bonne taille avant d'écrire quoi que ce soit : une ligne
+        # sans archive derrière nous ferait croire ce logement remplaçable.
+        vu = _poster_au_serveur(url_fn, {
+            "etape": "confirmer",
+            "slug": slug,
+            "chemin": chemin,
+            "octets": octets,
+            "chiffree": True,
+            "sha256": empreinte,
+            "contenu": {"modules": modules, "base_de_donnees": False},
+        })
+        if not vu.get("enregistre"):
+            raise ValueError("le serveur n'a pas constaté le dépôt")
+
+        print("[hub-agent] copie déposée hors du logement : %d octets" % octets,
+              flush=True)
+        return {"slug": slug, "octets": octets, "sha256": empreinte,
+                "modules": modules, "effacees": vu.get("effacees") or []}
+    finally:
+        # Réussite ou échec, l'archive partielle n'a plus rien à faire là.
+        try:
+            sup.supprimer_sauvegarde(slug)
+        except Exception as e:
+            print("[hub-agent] archive %s non effacée : %s" % (slug, e), flush=True)
 
 
 def traiter(commands, ha, store, sup=None, version_ha=None, differes=None):
