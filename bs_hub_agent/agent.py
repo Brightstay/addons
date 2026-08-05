@@ -3109,6 +3109,69 @@ def pile_zigbee(ha):
     return None
 
 
+# ⛔ CE QUI ARRIVE PENDANT LA FENÊTRE, PERSONNE NE LE DIT.
+#    L'hôte ouvre l'appairage, réveille son capteur, et… rien. L'appareil est
+#    bien entré, mais il n'apparaîtra que s'il pense à revenir sur l'écran
+#    d'installation. Debout à côté de son capteur, c'est le seul moment où il
+#    peut le nommer sans se demander de quoi on parle.
+#
+# ⚠️ ON COMPARE, ON NE DEVINE PAS. La pile Zigbee ne nous prévient pas ; on
+#    photographie ce que Home Assistant connaît à l'ouverture, et on regarde ce
+#    qui s'y est ajouté ensuite. Un appareil apparaît souvent en plusieurs
+#    entités — température, humidité, pile — donc on les regroupe pour dire
+#    « un appareil » et non « six choses ».
+_APPAIRAGE = {"ouvert_le": 0.0, "avant": None}
+# On regarde après la fenêtre : un appareil met parfois une minute à finir de
+# se présenter. Au-delà, ce qui arrive n'a plus de rapport avec l'appairage.
+_FENETRE_ARRIVEES = 10 * 60
+
+
+def _entites(ha):
+    try:
+        return {str(e.get("entity_id")): (e.get("attributes") or {}).get("friendly_name")
+                for e in (ha.states() or []) if e.get("entity_id")}
+    except Exception:
+        return {}
+
+
+def _appareil_de(entite):
+    """Le nom de l'appareil derrière une entité, pour ne pas le compter six fois."""
+    sans_domaine = entite.split(".", 1)[-1]
+    # `capteur_salon_temperature` et `capteur_salon_humidite` sont le même objet.
+    return sans_domaine.rsplit("_", 1)[0] if "_" in sans_domaine else sans_domaine
+
+
+def regarder_les_arrivees(ha):
+    """Un appareil est-il entré depuis l'ouverture ? Rend un événement ou None."""
+    if not _APPAIRAGE["avant"]:
+        return None
+    if time.monotonic() - _APPAIRAGE["ouvert_le"] > _FENETRE_ARRIVEES:
+        _APPAIRAGE["avant"] = None
+        return None
+
+    maintenant = _entites(ha)
+    nouvelles = [e for e in maintenant if e not in _APPAIRAGE["avant"]]
+    if not nouvelles:
+        return None
+    _APPAIRAGE["avant"] = None            # une annonce par appairage, pas plus
+
+    appareils = {}
+    for e in nouvelles:
+        appareils.setdefault(_appareil_de(e), maintenant.get(e) or e)
+    noms = sorted(appareils.values())[:5]
+    return {
+        "type": "zigbee", "severity": "info",
+        "payload": {"operation": "appairage", "phase": "fin",
+                    "appareils": len(appareils), "noms": noms,
+                    "detail": ("%d appareil%s vient d'être appairé : %s"
+                               % (len(appareils), "s" if len(appareils) > 1 else "",
+                                  ", ".join(noms)))},
+        "occurred_at": _now_iso(),
+        # L'heure dans la clé : deux appairages le même jour sont deux nouvelles.
+        "dedup_key": "zigbee-arrivee-" + time.strftime("%Y%m%d%H%M", time.gmtime()),
+    }
+
+
 def ouvrir_appairage(ha, duree=None):
     """Ouvre l'appairage sur la pile en place. Rend (statut, résultat)."""
     secondes = int(duree or DUREE_APPAIRAGE_S)
@@ -3128,6 +3191,10 @@ def ouvrir_appairage(ha, duree=None):
         })
     else:
         ha.call_service("zha", "permit", {"duration": secondes})
+
+    # La photo d'avant : c'est elle qui permettra de dire ce qui est arrivé.
+    _APPAIRAGE["avant"] = _entites(ha)
+    _APPAIRAGE["ouvert_le"] = time.monotonic()
 
     try:
         journal_evenement("zigbee", "info",
@@ -5119,6 +5186,11 @@ def main():
                 # Et une fois posée, on la surveille : une clé débranchée ou
                 # remplacée laisse une passerelle morte que rien ne signale.
                 evt = surveiller_passerelle(ha, sup)
+                if evt:
+                    evenements.append(evt)
+                # Et ce qui vient d'entrer, tant que l'hôte est encore debout
+                # à côté de son capteur.
+                evt = regarder_les_arrivees(ha)
                 if evt:
                     evenements.append(evt)
             except Exception as e:

@@ -1,3 +1,9 @@
+## 0.6.7 — 2026-08-05
+
+- Quand un appareil vient d'être appairé, le boîtier l'annonce et le nomme, au
+  lieu de laisser l'hôte deviner si ça a marché. Un capteur qui arrive en
+  plusieurs mesures est compté comme un seul appareil.
+
 ## 0.6.6 — 2026-08-05
 
 - La passerelle Zigbee est surveillée. Une clé débranchée est signalée au lieu
