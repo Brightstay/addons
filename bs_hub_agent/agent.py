@@ -58,6 +58,222 @@ DOMAINES_RECHARGEABLES = {"automation", "script", "template", "input_boolean",
 
 
 # =====================================================================
+# ⛔ CE QUE LE BOÎTIER REFUSE DE FAIRE, MÊME SI ON LE LUI DEMANDE
+#
+# ⚠️ UN ORDRE DÉPOSÉ DANS LA FILE DÉCIDE DE CE QUI S'EXÉCUTE AU DOMICILE D'UN
+#    CLIENT. Borner le DOSSIER où l'agent écrit ne suffit pas, car c'est le
+#    contenu du fichier qui agit une fois la configuration relue. Et laisser
+#    l'appel de service viser ce qu'il veut revient à n'avoir aucune limite :
+#    la porte du logement est un service comme un autre.
+#
+# ⚠️ CE N'EST PAS UNE REDONDANCE AVEC LES LISTES DU SERVEUR. Nos routes
+#    n'acceptent déjà que six types d'ordres — et c'est très bien. Mais l'agent
+#    exécute ce qu'il TROUVE DANS LA FILE, pas ce que nos routes ont accepté :
+#    une clé de service qui fuite, un compte administrateur pris, une politique
+#    RLS trop large, et le serveur n'est plus dans le chemin. La limite doit
+#    exister dans la machine, sinon elle n'existe pas.
+#
+# ⚠️ ET AUCUN SERVICE QUI EN APPELLE UN AUTRE. `script.turn_on`, `scene.turn_on`
+#    et `automation.trigger` sont absents EXPRÈS : un script écrit sur mesure
+#    peut appeler n'importe quoi, une scène peut poser l'état « déverrouillé »
+#    sur une serrure. Les autoriser reviendrait à publier la liste blanche et à
+#    laisser une porte de service à côté.
+# =====================================================================
+SERVICES_AUTORISES = {
+    # Le canal de notification (routeur SQL → `hub.service notify`).
+    "notify": None,                      # None = tout le domaine
+    "persistent_notification": {"create", "dismiss"},
+    # Le confort du logement, ce que le pad pilote déjà.
+    "light":         {"turn_on", "turn_off", "toggle"},
+    "switch":        {"turn_on", "turn_off", "toggle"},
+    "fan":           {"turn_on", "turn_off", "toggle", "set_percentage"},
+    "cover":         {"open_cover", "close_cover", "stop_cover", "set_cover_position"},
+    "climate":       {"turn_on", "turn_off", "set_temperature", "set_hvac_mode"},
+    "media_player":  {"turn_off", "media_pause", "media_play", "volume_set"},
+    "input_boolean": {"turn_on", "turn_off", "toggle"},
+    "input_number":  {"set_value"},
+    "input_select":  {"select_option"},
+    "homeassistant": {"turn_on", "turn_off", "update_entity"},
+}
+
+# Les domaines qui ne doivent JAMAIS apparaître — ni appelés par `hub.service`,
+# ni écrits dans un fichier de configuration. `shell_command`, `command_line` et
+# `python_script` exécutent du code ; `hassio` pilote la machine ; `lock` et
+# `alarm_control_panel` ouvrent le logement.
+#
+# ⚠️ `rest_command` N'EST PAS DANS CETTE LISTE, ET C'EST VOLONTAIRE : c'est un
+#    appel HTTP, pas une exécution — et c'est le tuyau par lequel nos propres
+#    automatismes remontent leurs événements. L'interdire couperait la
+#    surveillance du parc pour un gain nul.
+DOMAINES_INTERDITS = ("shell_command", "command_line", "python_script",
+                      "hassio", "lock", "alarm_control_panel")
+
+# ⛔ LE FILET DE TEXTE, GARDÉ MAIS DÉCLASSÉ EN SECOND RIDEAU.
+#
+# ⚠️ CHERCHER DES MOTS DANS UN FICHIER N'EST PAS LE LIRE. Un même contenu
+#    s'écrit de plusieurs façons en YAML, toutes légales et toutes acceptées
+#    par Home Assistant ; une expression qui vise une mise en page ne juge que
+#    cette mise en page. La lecture du fichier, plus bas, est le vrai contrôle,
+#    et ces expressions ne servent qu'en secours, si la lecture échoue.
+_MOTIF = "|".join(DOMAINES_INTERDITS)
+_RUBRIQUE_INTERDITE = re.compile(r"^(?:%s)\s*:" % _MOTIF, re.M | re.I)
+_PLATEFORME_INTERDITE = re.compile(r"platform\s*:\s*(?:%s)\b" % _MOTIF, re.I)
+_APPEL_INTERDIT = re.compile(
+    r"(?:service|action)\s*:\s*[\"']?(?:%s)\." % _MOTIF, re.I)
+# N'importe où dans le fichier, sans se soucier de la mise en page.
+_N_IMPORTE_OU = re.compile(r"\b(?:shell_command|command_line|python_script)\b"
+                           r"|\b(?:hassio|lock|alarm_control_panel)\.", re.I)
+
+# Les clés qui portent le NOM d'un service à appeler. `action` est le mot de
+# Home Assistant depuis 2024.8 ; `service` l'ancien ; `service_template` le
+# très ancien. ⚠️ `action:` désigne AUSSI la liste des étapes d'une
+# automatisation — d'où le contrôle « seulement si la valeur est une chaîne ».
+_CLES_DE_SERVICE = ("service", "action", "service_template")
+
+try:
+    # Fourni par `py3-yaml` dans l'image de l'add-on (cf. Dockerfile).
+    import yaml as _yaml
+except ImportError:                                   # pragma: no cover
+    _yaml = None
+
+
+def _lecteur_tolerant():
+    """Un lecteur YAML qui ne s'étrangle pas sur les étiquettes de HA.
+
+    `!input`, `!secret`, `!include` ne sont pas du YAML standard : un lecteur
+    normal refuse le fichier, et « refusé » vaudrait « interdit ». On avale ces
+    étiquettes et on garde la structure — c'est elle qu'on inspecte.
+    """
+    class Tolerant(_yaml.SafeLoader):
+        pass
+    Tolerant.add_multi_constructor("", lambda loader, suffixe, noeud: None)
+    return Tolerant
+
+
+def _inspecter(noeud, profondeur=0):
+    """Parcourt le YAML lu et rend la raison du refus, ou None."""
+    if isinstance(noeud, dict):
+        for cle, valeur in noeud.items():
+            nom = str(cle).strip().lower() if cle is not None else ""
+            # Une rubrique de configuration : `shell_command:` en tête.
+            if profondeur == 0 and nom in DOMAINES_INTERDITS:
+                return "rubrique interdite : %s" % nom
+            if nom == "platform" and str(valeur).strip().lower() in DOMAINES_INTERDITS:
+                return "plateforme interdite : %s" % valeur
+            if nom in _CLES_DE_SERVICE and isinstance(valeur, str):
+                v = valeur.strip()
+                # ⛔ UN SERVICE QU'ON NE PEUT PAS LIRE EST REFUSÉ.
+                #    Home Assistant autorise un nom de service composé au
+                #    moment où l'automatisation part ; personne ne peut donc
+                #    savoir d'avance ce qu'il visera. On ne devine pas. Nos
+                #    recettes nomment toutes leur service en clair, c'est une
+                #    contrainte que nous respectons déjà.
+                if "{{" in v or "{%" in v:
+                    return "service calculé à l'exécution (invérifiable)"
+                if v.split(".")[0].strip().lower() in DOMAINES_INTERDITS:
+                    return "appel de service interdit : %s" % v
+            raison = _inspecter(valeur, profondeur + 1)
+            if raison:
+                return raison
+    elif isinstance(noeud, (list, tuple)):
+        for element in noeud:
+            raison = _inspecter(element, profondeur + 1)
+            if raison:
+                return raison
+    return None
+
+
+# ⚠️ NOS PROPRES OUTILS D'ENTRETIEN, ET RIEN QUE LES NÔTRES.
+#
+# ⛔ LA PREMIÈRE LISTE BLANCHE AURAIT COUPÉ LA MISE À JOUR DE LA FLOTTE.
+#    Elle refusait `script` en bloc, au motif qu'un script appelle n'importe
+#    quel service. C'était juste en théorie et faux en pratique : un add-on ne
+#    peut pas se remplacer lui-même (le Superviseur l'interdit), et le seul
+#    chemin qui marche est un script Home Assistant que NOUS installons, appelé
+#    par `script.turn_on`. Il a servi ce matin même. Déployer la liste telle
+#    quelle nous privait du moyen de déployer quoi que ce soit ensuite.
+#
+# On autorise donc ces deux domaines, mais bornés à NOS entités : le nom de la
+# cible est vérifié, pas seulement celui du service. Et ça n'ajoute aucun
+# pouvoir, car le contenu de ces scripts passe par `contenu_interdit()` avant
+# d'être écrit — un script à nous ne peut pas appeler ce que la liste refuse.
+NOS_SCRIPTS = ("script.brightstay_", "script.bs_")
+NOS_MISES_A_JOUR = ("update.brightstay_",)
+
+
+def _cibles(data):
+    """Les entités visées par l'ordre, quelle que soit la façon de les écrire."""
+    d = data if isinstance(data, dict) else {}
+    cible = d.get("entity_id")
+    if cible is None and isinstance(d.get("target"), dict):
+        cible = d["target"].get("entity_id")
+    if isinstance(cible, (list, tuple)):
+        return [str(x) for x in cible]
+    return [str(cible)] if cible else []
+
+
+def service_autorise(domaine, service, data=None):
+    """`hub.service` a-t-il le droit d'appeler ça ?"""
+    if domaine in DOMAINES_INTERDITS:
+        return False
+
+    # Nos scripts d'entretien. Home Assistant les expose des deux façons :
+    # `script.turn_on` avec l'entité en cible, ou le nom du script comme
+    # service. Les deux sont bornées au préfixe qui est le nôtre.
+    if domaine == "script":
+        if service == "turn_on":
+            visees = _cibles(data)
+            return bool(visees) and all(c.startswith(NOS_SCRIPTS) for c in visees)
+        return service.startswith(("brightstay_", "bs_"))
+
+    # La mise à jour d'un composant, bornée à la nôtre : `update.install` sur
+    # l'entité de l'agent Brightstay, jamais sur celles de l'hôte.
+    if domaine == "update":
+        if service != "install":
+            return False
+        visees = _cibles(data)
+        return bool(visees) and all(c.startswith(NOS_MISES_A_JOUR) for c in visees)
+
+    if domaine not in SERVICES_AUTORISES:
+        return False
+    permis = SERVICES_AUTORISES[domaine]
+    return permis is None or service in permis
+
+
+def contenu_interdit(contenu):
+    """Ce fichier de configuration contient-il de quoi exécuter du code ?
+
+    Rend la raison du refus, ou `None` si le fichier est acceptable.
+    """
+    texte = contenu or ""
+
+    # 1. Le filet grossier, d'abord : il ne dépend d'aucune bibliothèque.
+    if (_RUBRIQUE_INTERDITE.search(texte) or _PLATEFORME_INTERDITE.search(texte)
+            or _APPEL_INTERDIT.search(texte) or _N_IMPORTE_OU.search(texte)):
+        return "mot interdit dans le fichier (exécution ou serrure)"
+
+    # 2. Puis la vraie lecture. C'est elle qui voit ce que le texte cache.
+    if _yaml is None:                                 # pragma: no cover
+        # ⛔ ON NE DÉGRADE PAS EN SILENCE. L'image de l'add-on installe
+        #    `py3-yaml` ; si la bibliothèque manque, c'est que l'image n'est
+        #    pas celle qu'on croit — et on écrirait alors des fichiers qu'on
+        #    n'a pas su lire.
+        return "lecteur YAML absent de l'image : écriture refusée par précaution"
+    try:
+        documents = list(_yaml.load_all(texte, Loader=_lecteur_tolerant()))
+    except Exception as e:
+        # Un fichier qu'on ne sait pas lire ne s'écrit pas. Home Assistant le
+        # refuserait de toute façon ; autant refuser tout de suite, avec le
+        # motif, plutôt que de laisser un fichier mort sur le disque.
+        return "YAML illisible : %s" % str(e).splitlines()[0][:120]
+    for document in documents:
+        raison = _inspecter(document)
+        if raison:
+            return raison
+    return None
+
+
+# =====================================================================
 # Comparer deux versions — « 0.1.0 » vs « 0.4.0 », « 2026.7.3 » vs « 2026.8 ».
 # Miroir EXACT de public.version_au_moins() côté base : le serveur écarte déjà
 # les hubs trop anciens, ceci est la deuxième ceinture, côté hub.
@@ -121,11 +337,20 @@ class HA:
             #    la garde.
             detail = ""
             try:
-                detail = e.read().decode()[:300]
+                detail = e.read().decode()[:300].strip()
             except Exception:
                 pass
+            # ⛔ ET SI LE CORPS NE FAIT QUE RÉPÉTER LE CODE, ON LE TAIT.
+            #    On lisait « HTTP Error 400: Bad Request — 400: Bad Request » :
+            #    la même chose deux fois, ce qui donne l'illusion d'une
+            #    précision et n'en apporte aucune. Home Assistant renvoie
+            #    souvent son propre corps sous la forme « 400: Bad Request ».
+            sans_interet = detail.replace(" ", "").lower() in (
+                "", ("%d:%s" % (e.code, e.reason)).replace(" ", "").lower(),
+                str(e.code), str(e.reason).replace(" ", "").lower())
             raise urllib.error.HTTPError(
-                e.url, e.code, "%s%s" % (e.reason, (" — " + detail) if detail else ""),
+                e.url, e.code,
+                "%s%s" % (e.reason, "" if sans_interet else " — " + detail),
                 e.headers, None)
 
     def check_config(self):
@@ -136,7 +361,35 @@ class HA:
         return self._req("POST", "/api/services/%s/reload" % domain, {})
 
     def call_service(self, domain, service, data=None):
-        return self._req("POST", "/api/services/%s/%s" % (domain, service), data or {})
+        """Appelle un service, et dit CE QU'ON A DEMANDÉ quand ça rate.
+
+        ⚠️ HOME ASSISTANT NE DIRA JAMAIS POURQUOI. Son refus tient en trois
+           chiffres : un service qui n'existe pas et un appel auquel il manque
+           une cible rendent tous les deux « 400 », avec un corps qui répète
+           « 400: Bad Request ». Vérifié sur un vrai Home Assistant le
+           04/08/2026 : `script.inexistant` et `light.turn_on` sans entité
+           donnent le même message, au caractère près.
+
+           On lisait donc « HTTP Error 400 » dans le journal d'un boîtier, sans
+           savoir de quel appel on parlait. La seule information disponible est
+           celle que NOUS possédons : ce qu'on a demandé, et à qui.
+        """
+        try:
+            return self._req("POST", "/api/services/%s/%s" % (domain, service), data or {})
+        except urllib.error.HTTPError as e:
+            if e.code != 400:
+                raise
+            cible = ""
+            if isinstance(data, dict):
+                vise = data.get("entity_id") or (data.get("target") or {}).get("entity_id")
+                if vise:
+                    cible = " sur %s" % (", ".join(vise) if isinstance(vise, list) else vise)
+            raise urllib.error.HTTPError(
+                e.url, e.code,
+                "« %s.%s »%s refusé par Home Assistant : ce service n'existe pas "
+                "sur ce boîtier, ou il manque une cible à l'appel"
+                % (domain, service, cible),
+                e.headers, None)
 
     def state(self, entity_id):
         try:
@@ -2580,6 +2833,14 @@ class Store:
 
     def put(self, rel, content):
         cible = self._resoudre(rel)
+        # ⛔ LE DOSSIER NE SUFFIT PAS : C'EST LE CONTENU QUI EXÉCUTE.
+        #    Écrire dans `packages/brightstay…` était réputé sans risque parce
+        #    que le chemin est borné. Mais le contenu d'un fichier de
+        #    configuration agit dès que Home Assistant le relit. Le périmètre
+        #    protégeait les fichiers de l'hôte, pas l'hôte.
+        raison = contenu_interdit(content)
+        if raison:
+            raise ValueError("contenu refusé (%s) : %s" % (raison, rel))
         os.makedirs(os.path.dirname(cible), exist_ok=True)
         # écriture atomique : temp + rename (jamais de fichier à moitié écrit)
         tmp = cible + ".tmp"
@@ -2700,9 +2961,16 @@ def dispatch(cmd, ha, store, sup=None, version_ha=None, differes=None):
         return "acked", {"reloaded": domain}
 
     if t == "hub.service":
-        # ex. serrure : {domain:'lock', service:'unlock', data:{entity_id:...}}
-        ha.call_service(p["domain"], p["service"], p.get("data"))
-        return "acked", {"called": p["domain"] + "." + p["service"]}
+        # ⛔ LA LISTE BLANCHE D'ABORD. Cette ligne acceptait n'importe quel
+        #    domaine — son commentaire donnait même la serrure en exemple.
+        #    Voir SERVICES_AUTORISES pour le raisonnement.
+        domaine = str(p.get("domain") or "")
+        service = str(p.get("service") or "")
+        if not service_autorise(domaine, service, p.get("data")):
+            return "failed", {"error":
+                "service refusé par le boîtier : %s.%s" % (domaine, service)}
+        ha.call_service(domaine, service, p.get("data"))
+        return "acked", {"called": domaine + "." + service}
 
     if t == "hub.inventaire":
         # « Qu'est-ce qu'il y a dans ce logement ? » — la réponse part dans
@@ -3392,12 +3660,19 @@ def _plomberie_ha(entity_id):
 
 
 # ⚠️ LA MESURE FINE EST RÉSERVÉE AU PALIER CANARI, ET C'EST UN CHOIX DE COÛT.
-#    Un relevé toutes les dix minutes fait 144 lignes par jour et par boîtier.
-#    Sur un parc de cinq cents kits, c'est 72 000 lignes par jour pour une
+#    Un relevé toutes les trente minutes fait 48 lignes par jour et par boîtier.
+#    Sur un parc de cinq cents kits, c'est 24 000 lignes par jour pour une
 #    courbe que personne ne regardera. Les boîtiers d'essai, eux, sont là pour
 #    être regardés : c'est sur eux qu'on veut le détail.
 #    Ailleurs, l'instantané horaire suffit — il porte déjà la température.
-PERIODE_MESURE_S = 600
+#
+# ⚠️ TRENTE MINUTES, ET PAS DIX. Le pas était de dix minutes ; sur une semaine
+#    de courbe, c'est un millier de points pour une machine qui vit entre 45 et
+#    55 °C — trois fois plus de lignes sans un degré d'information en plus. Une
+#    machine qui s'emballe met des heures, pas des minutes : un point toutes les
+#    demi-heures montre la même pente. Ce qui monte VITE (un ordre qui traîne,
+#    un hub muet) est déjà surveillé ailleurs, en continu.
+PERIODE_MESURE_S = 1800
 
 
 def _fichier_mesures():
@@ -3413,8 +3688,8 @@ def mesures_fines():
        le garde sur disque : au redémarrage suivant il s'en souvient, sans avoir
        à redemander.
 
-    ⚠️ ÉTEINT PAR DÉFAUT. 144 relevés par jour et par boîtier : sur cinq cents
-       kits, 72 000 lignes quotidiennes pour une courbe que personne n'ouvrira.
+    ⚠️ ÉTEINT PAR DÉFAUT. 48 relevés par jour et par boîtier : sur cinq cents
+       kits, 24 000 lignes quotidiennes pour une courbe que personne n'ouvrira.
        Les kits d'essai sont là pour être regardés ; les autres, pour tourner.
     """
     if os.environ.get("BS_MESURES_FINES", "").lower() in ("1", "true", "on", "oui"):
@@ -3476,13 +3751,13 @@ _DERNIERE_MESURE = {"quand": 0.0}
 
 
 def evenement_temperature(pad_temp=None):
-    """Un relevé de température, toutes les dix minutes, sur les kits d'essai.
+    """Un relevé de température, toutes les trente minutes, sur les kits d'essai.
 
     ⚠️ SÉPARÉ DE L'INSTANTANÉ, ET C'EST VOULU. L'instantané part à chaque
        contact mais n'est CONSERVÉ qu'une fois par heure (déduplication). Pour
-       une courbe, une heure est trop grossier — une machine qui chauffe le
-       fait en quelques minutes. Cet événement-ci a sa propre clé, au pas de
-       dix minutes.
+       une courbe, une heure laisse passer la moitié d'une montée en charge.
+       Cet événement-ci a sa propre clé, au pas de trente minutes : deux points
+       par heure, assez pour voir la pente sans doubler la table.
 
     Rend `None` quand il n'y a rien à dire : pas de palier canari, pas de
     mesure, ou l'intervalle n'est pas écoulé.
@@ -3501,10 +3776,12 @@ def evenement_temperature(pad_temp=None):
         "severity": "info",
         "payload": {"hub": hub, "pad": pad_temp},
         "occurred_at": _now_iso(),
-        # Une empreinte par tranche de dix minutes : deux relevés du même
-        # créneau ne font qu'une ligne, même si l'agent redémarre entre-temps.
+        # Une empreinte par demi-heure : deux relevés du même créneau ne font
+        # qu'une ligne, même si l'agent redémarre entre-temps. C'est le vrai
+        # garde-fou du pas de mesure — le compteur en mémoire, lui, repart à
+        # zéro à chaque redémarrage de l'agent.
         "dedup_key": "temp-" + time.strftime("%Y%m%d%H", time.gmtime())
-                     + "-%d" % (int(time.gmtime().tm_min / 10)),
+                     + "-%d" % (int(time.gmtime().tm_min / 30)),
     }
 
 

@@ -1,3 +1,15 @@
+## 0.5.21 — 2026-08-04
+
+- L'agent n'accepte plus qu'une liste fermée d'appels de service : lumières,
+  volets, thermostats, interrupteurs et notifications. Une serrure ne se pilote
+  pas par ce chemin, et rien ne peut lui faire exécuter une commande.
+- Avant d'écrire un fichier de configuration, il le lit et refuse ce qui
+  contiendrait de quoi exécuter du code. Un fichier illisible est refusé aussi,
+  au lieu d'être posé puis annulé.
+- Ses outils d'entretien restent utilisables, bornés aux composants Brightstay.
+- Quand Home Assistant refuse un appel, le message dit ce qui a été demandé et à
+  quoi. Il répétait le code d'erreur deux fois sans jamais nommer le geste.
+
 ## 0.5.20 — 2026-08-04
 
 - À DÉCRIRE : ce que cette version change pour un hôte.

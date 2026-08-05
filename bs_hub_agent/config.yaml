@@ -1,7 +1,7 @@
 # Manifeste de l'add-on — c'est ce que Home Assistant lit pour savoir quoi
 # installer, avec quels droits, et sous quel nom l'afficher.
 name: Brightstay Hub Agent
-version: "0.5.20"
+version: "0.5.21"
 slug: bs_hub_agent
 description: Relie le logement à Brightstay — remonte ce que voit le boîtier, applique ce qu'on lui demande, et sert la page de la tablette.
 url: https://github.com/Brightstay/addons/tree/main/bs_hub_agent
@@ -69,9 +69,9 @@ schema:
   # À l'atelier : Home Assistant → profil → tout en bas → « jetons d'accès de
   # longue durée » → créer, puis coller ici.
   ha_token: "password?"
-  # ⚠️ RÉSERVÉ AUX KITS D'ESSAI. Un relevé de température toutes les dix
-  # minutes fait 144 lignes par jour et par boîtier ; sur un parc de cinq
-  # cents kits, 72 000 lignes par jour pour une courbe que personne ne
+  # ⚠️ RÉSERVÉ AUX KITS D'ESSAI. Un relevé de température toutes les trente
+  # minutes fait 48 lignes par jour et par boîtier ; sur un parc de cinq
+  # cents kits, 24 000 lignes par jour pour une courbe que personne ne
   # regardera. L'instantané horaire suffit partout ailleurs.
   mesures_fines: "bool?"
 

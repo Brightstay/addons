@@ -1,10 +1,14 @@
 ARG BUILD_FROM
 FROM ${BUILD_FROM}
 
-# L'agent n'utilise que la bibliothèque standard de Python — aucune dépendance
-# à installer, donc rien qui puisse casser parce qu'une bibliothèque a bougé.
-# Mais Python lui-même n'est pas dans l'image de base : on l'ajoute.
-RUN apk add --no-cache python3
+# Python n'est pas dans l'image de base : on l'ajoute.
+#
+# ⚠️ UNE SEULE DÉPENDANCE, ET ELLE EST LÀ POUR UNE RAISON DE SÉCURITÉ.
+# L'agent tenait tout entier sur la bibliothèque standard, ce qui était une
+# qualité. Mais il doit juger le CONTENU des fichiers de configuration qu'il
+# écrit, et juger un YAML suppose de le lire vraiment. `py3-yaml` est la
+# bibliothèque qu'utilise Home Assistant lui-même : même lecteur, même verdict.
+RUN apk add --no-cache python3 py3-yaml
 
 COPY agent.py /agent.py
 # ⚠️ LE SOCLE VOYAGE DANS L'IMAGE, et cette ligne est ce qui le garantit.
