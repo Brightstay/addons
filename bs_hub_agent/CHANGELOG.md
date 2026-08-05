@@ -1,3 +1,10 @@
+## 0.6.4 — 2026-08-05
+
+- Brancher la clé Zigbee suffit : le boîtier la voit apparaître et pose la
+  passerelle tout seul, sans qu'on lui demande rien.
+- Si ça rate, il le signale et réessaie plus tard, de plus en plus tard — une
+  clé morte ne fait pas réinstaller un module toutes les cinq minutes.
+
 ## 0.6.3 — 2026-08-05
 
 - Le boîtier branche lui-même Home Assistant sur son broker. Sans ce lien, les

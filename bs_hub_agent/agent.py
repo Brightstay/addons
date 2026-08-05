@@ -3305,6 +3305,59 @@ def poser_passerelle_zigbee(ha, sup):
                      "modules": fait, "mqtt": lien}
 
 
+# Ce que la veille a déjà tenté, pour ne pas recommencer en boucle.
+_VEILLE_ZIGBEE = {"tentee_le": 0.0, "echecs": 0}
+# Un échec se retente, mais de plus en plus tard : une clé morte ne doit pas
+# faire réinstaller un module toutes les cinq minutes pendant des mois.
+_REPOS_VEILLE = (5 * 60, 30 * 60, 6 * 3600)
+
+
+def veiller_sur_la_cle_zigbee(ha, sup):
+    """Une clé vient d'apparaître et rien ne la pilote ? On s'en occupe.
+
+    Rend un événement à remonter, ou None quand il n'y a rien à dire.
+
+    ⚠️ ON NE FAIT RIEN TANT QU'IL N'Y A RIEN À FAIRE. Pas de clé, ou une
+       passerelle déjà en place : on sort tout de suite, sans un appel de plus.
+       Cette fonction tourne à chaque contact du boîtier, toutes les cinq
+       minutes, sur tout le parc.
+    """
+    if sup is None:
+        return None
+    if pile_zigbee(ha):
+        return None
+    if not port_zigbee(sup):
+        return None
+
+    repos = _REPOS_VEILLE[min(_VEILLE_ZIGBEE["echecs"], len(_REPOS_VEILLE) - 1)]
+    if _VEILLE_ZIGBEE["echecs"] and time.time() - _VEILLE_ZIGBEE["tentee_le"] < repos:
+        return None
+    _VEILLE_ZIGBEE["tentee_le"] = time.time()
+
+    # ⛔ UNE VEILLE NE LÈVE PAS D'EXCEPTION, ELLE RAPPORTE. Celle-ci tourne
+    #    dans la boucle du boîtier : une erreur qui remonte y serait attrapée
+    #    par la garde générale, qui l'imprime et passe — donc sans compter
+    #    l'échec, sans espacer les tentatives, et sans rien dire à personne.
+    #    On réessaierait toutes les cinq minutes, pour toujours.
+    try:
+        statut, res = poser_passerelle_zigbee(ha, sup)
+    except Exception as e:
+        statut, res = "failed", {"error": str(e)[:160]}
+    if statut != "acked":
+        _VEILLE_ZIGBEE["echecs"] += 1
+        return {"type": "zigbee", "severity": "warning",
+                "payload": {"operation": "passerelle", "phase": "echec",
+                            "detail": str(res.get("error"))[:160]},
+                "occurred_at": _now_iso(),
+                "dedup_key": "zigbee-passerelle-echec"}
+    _VEILLE_ZIGBEE["echecs"] = 0
+    return {"type": "zigbee", "severity": "info",
+            "payload": {"operation": "passerelle", "phase": "fin",
+                        "detail": "clé Zigbee reconnue, passerelle en place"},
+            "occurred_at": _now_iso(),
+            "dedup_key": "zigbee-passerelle-posee"}
+
+
 def _confirmer_mqtt(ha):
     """Branche Home Assistant sur le broker du boîtier.
 
@@ -4847,6 +4900,20 @@ def main():
                     sante.append(mesure)
             except Exception as e:
                 print("[hub-agent] instantané KO:", e, flush=True)
+
+            # ⛔ BRANCHER LA CLÉ DOIT SUFFIRE.
+            #    Elle arrive séparément du boîtier, et c'est l'hôte qui la
+            #    branche. Sans ce regard, il ne se passe rien : la clé s'allume,
+            #    aucun appareil n'apparaît, et il appelle. Or personne ne peut
+            #    deviner qu'il reste deux modules à installer, encore moins un
+            #    hôte à qui l'on a promis qu'il n'aurait pas à toucher à Home
+            #    Assistant. Le boîtier voit la clé apparaître et fait le reste.
+            try:
+                evt = veiller_sur_la_cle_zigbee(ha, sup)
+                if evt:
+                    evenements.append(evt)
+            except Exception as e:
+                print("[hub-agent] veille zigbee KO:", e, flush=True)
 
             differes = []
             # Ce que le serveur de la tablette a signalé entre deux tours : il
