@@ -1,3 +1,11 @@
+## 0.5.22 — 2026-08-05
+
+- L'hôte peut ajouter un appareil Zigbee depuis son espace, sans passer par
+  Home Assistant : le boîtier ouvre l'appairage soixante secondes, puis le
+  referme de lui-même. Un réseau laissé ouvert accepterait l'appareil du voisin.
+- Le boîtier reconnaît seul sa passerelle, Zigbee2MQTT ou ZHA. Rien à régler,
+  rien à déclarer.
+
 ## 0.5.21 — 2026-08-04
 
 - L'agent n'accepte plus qu'une liste fermée d'appels de service : lumières,

@@ -402,6 +402,17 @@ class HA:
     def states(self):
         return self._req("GET", "/api/states")
 
+    def services(self):
+        """Ce que Home Assistant sait faire, sur CE boîtier.
+
+        ⚠️ ON NE DEMANDE PAS À L'HÔTE QUELLE PILE ZIGBEE IL A. Il ne le sait
+           pas, et il n'a pas à le savoir : c'est une affaire d'installateur.
+           Le boîtier regarde les services qu'il expose et en déduit ce qui est
+           en place. Une question de moins dans un parcours, c'est une erreur
+           de moins.
+        """
+        return self._req("GET", "/api/services")
+
     def config(self):
         """La version et l'état, demandés au principal intéressé.
 
@@ -2883,6 +2894,84 @@ def _differer(differes, nom, action, resume, cible=None):
     return "acked", {"lance": resume}
 
 
+# =====================================================================
+# OUVRIR L'APPAIRAGE ZIGBEE — soixante secondes, puis ça se referme seul
+#
+# ⛔ LE TROU QUE ÇA COMBLE. Notre parcours d'installation savait créer des
+#    pièces et y ranger des appareils : il ne lisait QUE ce que Home Assistant
+#    voyait déjà. Un hôte qui achetait un capteur n'avait aucun moyen de le
+#    faire entrer, puisqu'il n'a accès ni à Home Assistant ni à la tablette.
+#    Il pouvait ranger sa maison, pas y ajouter une pièce.
+#
+# ⚠️ ET ON NE LUI DEMANDE PAS QUELLE PILE IL UTILISE. Zigbee2MQTT ou ZHA, c'est
+#    une décision d'installateur, prise une fois. Le boîtier regarde les
+#    services que Home Assistant expose et en déduit lequel est là.
+#
+# ⚠️ SOIXANTE SECONDES, ET PAS « OUVERT ». Un réseau Zigbee laissé ouvert
+#    accepte n'importe quel appareil du voisinage, et un appareil appairé par
+#    erreur se retire à la main, dans une interface que l'hôte n'a pas. La
+#    fenêtre se referme d'elle-même : c'est le seul réglage qui ne demande
+#    aucune vigilance.
+# =====================================================================
+DUREE_APPAIRAGE_S = 60
+SUJET_Z2M = "zigbee2mqtt/bridge/request/permit_join"
+
+
+def pile_zigbee(ha):
+    """« zigbee2mqtt », « zha », ou None si aucune n'est en place."""
+    try:
+        familles = ha.services()
+    except Exception:
+        return None
+    dispo = {}
+    for f in familles or []:
+        if isinstance(f, dict) and f.get("domain"):
+            dispo[f["domain"]] = set((f.get("services") or {}).keys())
+
+    # Zigbee2MQTT d'abord : quand les deux sont là, c'est lui qui pilote la
+    # clé, ZHA ne ferait que répondre à côté.
+    if "mqtt" in dispo and "publish" in dispo["mqtt"]:
+        try:
+            entites = ha.states() or []
+        except Exception:
+            entites = []
+        if any("zigbee2mqtt" in str(e.get("entity_id", "")) for e in entites):
+            return "zigbee2mqtt"
+    if "zha" in dispo and "permit" in dispo["zha"]:
+        return "zha"
+    # MQTT présent mais aucun signe de Zigbee2MQTT : le broker sert à autre
+    # chose. On ne devine pas.
+    return None
+
+
+def ouvrir_appairage(ha, duree=None):
+    """Ouvre l'appairage sur la pile en place. Rend (statut, résultat)."""
+    secondes = int(duree or DUREE_APPAIRAGE_S)
+    # Une fenêtre longue est une fenêtre oubliée : on borne des deux côtés.
+    secondes = max(30, min(secondes, 300))
+
+    pile = pile_zigbee(ha)
+    if pile is None:
+        return "failed", {"error":
+            "aucune passerelle Zigbee sur ce boîtier : la clé n'est pas "
+            "branchée, ou son module n'est pas installé"}
+
+    if pile == "zigbee2mqtt":
+        ha.call_service("mqtt", "publish", {
+            "topic": SUJET_Z2M,
+            "payload": json.dumps({"time": secondes}),
+        })
+    else:
+        ha.call_service("zha", "permit", {"duration": secondes})
+
+    try:
+        journal_evenement("zigbee", "info",
+                          {"operation": "appairage", "pile": pile, "duree_s": secondes})
+    except Exception:
+        pass
+    return "acked", {"pile": pile, "duree_s": secondes}
+
+
 def dispatch(cmd, ha, store, sup=None, version_ha=None, differes=None):
     t = cmd.get("type")
     p = cmd.get("payload") or {}
@@ -2971,6 +3060,12 @@ def dispatch(cmd, ha, store, sup=None, version_ha=None, differes=None):
                 "service refusé par le boîtier : %s.%s" % (domaine, service)}
         ha.call_service(domaine, service, p.get("data"))
         return "acked", {"called": domaine + "." + service}
+
+    if t == "hub.zigbee.appairage":
+        pret, raison = ha_pret(ha)
+        if not pret:
+            return "failed", {"error": raison}
+        return ouvrir_appairage(ha, p.get("duree_s"))
 
     if t == "hub.inventaire":
         # « Qu'est-ce qu'il y a dans ce logement ? » — la réponse part dans
