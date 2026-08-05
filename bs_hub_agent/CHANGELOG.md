@@ -1,3 +1,8 @@
+## 0.6.2 — 2026-08-05
+
+- Quand le boîtier règle un module, il ne remplace plus toute sa configuration :
+  il modifie ce qu'il doit modifier et laisse le reste intact.
+
 ## 0.6.1 — 2026-08-05
 
 - Le boîtier déclare lui-même la source de Zigbee2MQTT quand elle manque à son

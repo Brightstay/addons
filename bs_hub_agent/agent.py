@@ -838,10 +838,32 @@ class Supervisor:
         return {"slug": slug, "deja_pose": False, **depot}
 
     def regler_addon(self, slug, options):
+        """Modifie ce qu'on doit modifier, sans effacer le reste.
+
+        ⛔ LE SUPERVISEUR REMPLACE, IL NE COMPLÈTE PAS. On lui envoyait les
+           deux réglages qui nous intéressent ; il répondait « 400 » en
+           reprochant l'absence de tous les autres. Envoyer seulement les
+           siens, c'est proposer d'effacer la configuration d'un module qu'on
+           ne connaît pas — et c'est ce qu'il refuse, à raison.
+
+           On relit donc ce qui est en place et on pose nos valeurs par-dessus.
+           Le mélange se fait sur deux niveaux : `serial.port` ne doit pas
+           emporter `serial.baudrate` avec lui.
+        """
         if slug not in self.MODULES_POSABLES:
             raise ValueError("module hors du périmètre Brightstay : %s" % slug)
-        self._req("POST", "/addons/%s/options" % slug, {"options": options}, timeout=120)
-        return {"slug": slug, "regle": True}
+        fiche = self._req("GET", "/addons/%s/info" % slug) or {}
+        actuelles = ((fiche.get("data") or fiche).get("options") or {})
+        fusion = dict(actuelles)
+        for cle, valeur in (options or {}).items():
+            if isinstance(valeur, dict) and isinstance(actuelles.get(cle), dict):
+                fondu = dict(actuelles[cle])
+                fondu.update(valeur)
+                fusion[cle] = fondu
+            else:
+                fusion[cle] = valeur
+        self._req("POST", "/addons/%s/options" % slug, {"options": fusion}, timeout=120)
+        return {"slug": slug, "regle": sorted(options or {})}
 
     def demarrer_addon(self, slug):
         if slug not in self.MODULES_POSABLES:
