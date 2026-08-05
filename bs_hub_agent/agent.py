@@ -3667,6 +3667,113 @@ def _confirmer_mqtt(ha):
         return "à confirmer dans Home Assistant (%s)" % str(e)[:60]
 
 
+# =====================================================================
+# RELIER LE PONT QUE L'HÔTE A DÉJÀ
+#
+# ⛔ SES LAMPES NE VIENDRONT JAMAIS CHEZ NOUS. Une lampe Zigbee n'appartient
+#    qu'à un seul réseau : celles d'un hôte sont déjà mariées à son pont Philips
+#    Hue, et notre passerelle ne les verra pas, jamais. Lui demander de les
+#    sortir de son pont pour les appairer chez nous, c'est lui faire démonter
+#    son installation — et le perdre à la première question.
+#    On regarde donc par-dessus l'épaule du pont, sans rien remplacer.
+#
+# ⚠️ ET LE MOT DE PASSE, C'EST UN BOUTON. Le pont Hue n'a pas d'identifiants :
+#    il accepte un nouveau venu pendant les trente secondes qui suivent l'appui
+#    sur son gros bouton rond. Personne ne devine ça — c'est exactement ce que
+#    l'accompagnement doit porter, et c'est pour ça qu'on réessaie en boucle
+#    plutôt que d'échouer au premier refus.
+# =====================================================================
+def _options_du_formulaire(etape, nom_champ="id"):
+    """Les choix qu'un formulaire de Home Assistant propose pour un champ."""
+    for champ in (etape.get("data_schema") or []):
+        if champ.get("name") == nom_champ:
+            return [(str(o[0]), str(o[1])) for o in (champ.get("options") or [])
+                    if isinstance(o, (list, tuple)) and len(o) >= 2]
+    return []
+
+
+def _fermer_parcours(ha, ident):
+    """Ne jamais laisser un parcours ouvert derrière soi."""
+    try:
+        ha._req("DELETE", "/api/config/config_entries/flow/%s" % ident)
+    except Exception:
+        pass
+
+
+def chercher_ponts(ha):
+    """Quels ponts Hue le boîtier voit-il sur le réseau du logement ?"""
+    try:
+        etape = ha._req("POST", "/api/config/config_entries/flow",
+                        {"handler": "hue", "show_advanced_options": False}) or {}
+    except Exception as e:
+        return "failed", {"error": "Home Assistant n'a pas ouvert le parcours : %s" % str(e)[:120]}
+
+    if etape.get("type") == "abort":
+        _fermer_parcours(ha, etape.get("flow_id"))
+        # « déjà configuré » n'est pas une panne : c'est la bonne nouvelle.
+        return "acked", {"deja_relie": etape.get("reason") == "already_configured",
+                         "raison": etape.get("reason"), "ponts": []}
+
+    ponts = [{"id": i, "adresse": nom} for i, nom in _options_du_formulaire(etape)
+             if i != "manual"]
+    _fermer_parcours(ha, etape.get("flow_id"))
+    return "acked", {"ponts": ponts, "deja_relie": False}
+
+
+def relier_pont(ha, ident=None, secondes=60):
+    """Relie le pont, en attendant que l'hôte appuie sur son bouton."""
+    secondes = max(20, min(int(secondes or 60), 120))
+    try:
+        etape = ha._req("POST", "/api/config/config_entries/flow",
+                        {"handler": "hue", "show_advanced_options": False}) or {}
+    except Exception as e:
+        return "failed", {"error": "Home Assistant n'a pas ouvert le parcours : %s" % str(e)[:120]}
+
+    parcours = etape.get("flow_id")
+    if etape.get("type") == "abort":
+        _fermer_parcours(ha, parcours)
+        if etape.get("reason") == "already_configured":
+            return "acked", {"deja_relie": True}
+        return "failed", {"error": "aucun pont Hue trouvé sur le réseau du logement",
+                          "raison": etape.get("reason")}
+
+    # Le choix du pont. Un seul dans presque tous les logements : on ne pose
+    # pas une question dont la réponse est évidente.
+    if etape.get("step_id") == "init":
+        choix = [i for i, _ in _options_du_formulaire(etape) if i != "manual"]
+        if not choix:
+            _fermer_parcours(ha, parcours)
+            return "failed", {"error": "aucun pont Hue trouvé sur le réseau du logement"}
+        vise = ident if ident in choix else choix[0]
+        try:
+            etape = ha._req("POST", "/api/config/config_entries/flow/%s" % parcours,
+                            {"id": vise}) or {}
+        except Exception as e:
+            _fermer_parcours(ha, parcours)
+            return "failed", {"error": str(e)[:160]}
+
+    # ⛔ L'ÉTAPE DU BOUTON. Le pont refuse tant que personne n'a appuyé : on
+    #    réessaie posément jusqu'à ce qu'il accepte, au lieu de conclure à une
+    #    panne au premier « non ».
+    debut = time.monotonic()
+    while time.monotonic() - debut < secondes:
+        if etape.get("type") == "create_entry":
+            return "acked", {"relie": True, "nom": etape.get("title")}
+        if etape.get("type") == "abort":
+            _fermer_parcours(ha, parcours)
+            if etape.get("reason") == "already_configured":
+                return "acked", {"deja_relie": True}
+            return "failed", {"error": "le pont a refusé", "raison": etape.get("reason")}
+        time.sleep(3)
+        try:
+            etape = ha._req("POST", "/api/config/config_entries/flow/%s" % parcours, {}) or {}
+        except Exception:
+            continue
+
+    _fermer_parcours(ha, parcours)
+    return "failed", {"error": "personne n'a appuyé sur le bouton du pont"}
+
+
 def dispatch(cmd, ha, store, sup=None, version_ha=None, differes=None):
     t = cmd.get("type")
     p = cmd.get("payload") or {}
@@ -3761,6 +3868,18 @@ def dispatch(cmd, ha, store, sup=None, version_ha=None, differes=None):
         if not pret:
             return "failed", {"error": raison}
         return poser_passerelle_zigbee(ha, sup)
+
+    if t == "hub.pont.chercher":
+        pret, raison = ha_pret(ha)
+        if not pret:
+            return "failed", {"error": raison}
+        return chercher_ponts(ha)
+
+    if t == "hub.pont.relier":
+        pret, raison = ha_pret(ha)
+        if not pret:
+            return "failed", {"error": raison}
+        return relier_pont(ha, p.get("pont"), p.get("secondes"))
 
     if t == "hub.zigbee.appairage":
         pret, raison = ha_pret(ha)

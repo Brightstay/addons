@@ -1,3 +1,12 @@
+## 0.7.0 — 2026-08-05
+
+- Le boîtier sait relier le pont Philips Hue déjà présent dans le logement. Les
+  lampes restent sur leur pont et l'application du fabricant continue de
+  fonctionner : rien n'est démonté, tout est simplement lu en plus.
+- Le pont n'ayant pas de mot de passe, il faut appuyer sur son bouton. Le
+  boîtier réessaie posément pendant une minute au lieu d'abandonner au premier
+  refus, le temps que quelqu'un traverse la pièce.
+
 ## 0.6.7 — 2026-08-05
 
 - Quand un appareil vient d'être appairé, le boîtier l'annonce et le nomme, au
