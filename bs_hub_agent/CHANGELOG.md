@@ -1,3 +1,9 @@
+## 0.6.1 — 2026-08-05
+
+- Le boîtier déclare lui-même la source de Zigbee2MQTT quand elle manque à son
+  catalogue. Sans elle, l'installation échouait sur un code d'erreur qui
+  laissait croire à une panne alors qu'il manquait une adresse.
+
 ## 0.6.0 — 2026-08-05
 
 - L'hôte peut ajouter un appareil Zigbee depuis son espace, sans passer par

@@ -782,6 +782,29 @@ class Supervisor:
         "45df7312_zigbee2mqtt": "Zigbee2MQTT",
     }
 
+    # ⛔ UN MODULE ABSENT DU CATALOGUE NE S'INSTALLE PAS, ET ÇA NE SE DEVINE
+    #    PAS À L'ERREUR. Le boîtier connaît d'origine la boutique officielle et
+    #    la communauté ; Zigbee2MQTT vit dans un dépôt à part, qu'il faut
+    #    déclarer d'abord. Sans ça, l'installation rend « 404 » — trois
+    #    chiffres qui laissent croire à une panne alors qu'il manquait une
+    #    adresse. Vérifié sur le vrai boîtier le 05/08/2026 : Mosquitto était
+    #    au catalogue, Zigbee2MQTT non.
+    #
+    # ⚠️ La liste est ici, et elle est courte. Déclarer un dépôt, c'est
+    #    autoriser une source de code sur la machine d'un client.
+    DEPOTS_POSABLES = {
+        "45df7312_zigbee2mqtt": "https://github.com/zigbee2mqtt/hassio-zigbee2mqtt",
+    }
+
+    def declarer_depot(self, slug):
+        """Ajoute la source du module au catalogue, si elle manque."""
+        url = self.DEPOTS_POSABLES.get(slug)
+        if not url:
+            return {"depot": "aucun à déclarer"}
+        self._req("POST", "/store/repositories", {"repository": url}, timeout=300)
+        self.recharger_boutique()
+        return {"depot": url}
+
     def poser_addon(self, slug):
         """Installe le module s'il manque, et le démarre. Idempotent."""
         if slug not in self.MODULES_POSABLES:
@@ -792,16 +815,27 @@ class Supervisor:
         except Exception:
             deja = None
         pose = bool(deja and (deja.get("data") or deja).get("version"))
-        if not pose:
-            # La boutique d'abord : sur un boîtier qui n'a jamais rien installé,
-            # le dépôt communautaire n'est pas encore lu, et l'installation
-            # échoue sur un « inconnu » qui ne dit pas qu'il suffisait d'attendre.
-            try:
-                self.recharger_boutique()
-            except Exception:
-                pass
+        if pose:
+            return {"slug": slug, "deja_pose": True}
+
+        # La boutique d'abord : sur un boîtier qui n'a jamais rien installé, le
+        # catalogue n'est pas encore lu, et l'installation échoue sur un
+        # « inconnu » qui ne dit pas qu'il suffisait d'attendre.
+        try:
+            self.recharger_boutique()
+        except Exception:
+            pass
+        try:
             self._req("POST", "/store/addons/%s/install" % slug, {}, timeout=1800)
-        return {"slug": slug, "deja_pose": pose}
+            return {"slug": slug, "deja_pose": False}
+        except urllib.error.HTTPError as e:
+            if e.code != 404 or slug not in self.DEPOTS_POSABLES:
+                raise
+        # 404 : le module n'est pas au catalogue. On déclare sa source, et on
+        # réessaie une fois — deux, ce serait tourner en rond.
+        depot = self.declarer_depot(slug)
+        self._req("POST", "/store/addons/%s/install" % slug, {}, timeout=1800)
+        return {"slug": slug, "deja_pose": False, **depot}
 
     def regler_addon(self, slug, options):
         if slug not in self.MODULES_POSABLES:
