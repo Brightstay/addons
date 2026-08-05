@@ -1,3 +1,10 @@
+## 0.5.24 — 2026-08-05
+
+- Quand le boîtier ne trouve pas de clé Zigbee, il dit maintenant quels ports
+  il a regardés. Un refus qui ne montre rien oblige à chercher à l'aveugle.
+- Une clé dont le nom ne nous est pas familier est quand même acceptée : les
+  modèles changent plus vite que nos listes.
+
 ## 0.5.23 — 2026-08-05
 
 - Le boîtier sait poser lui-même sa passerelle Zigbee : il reconnaît la clé

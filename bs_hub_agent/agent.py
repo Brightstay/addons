@@ -3062,24 +3062,49 @@ def _adaptateur_de(chemin):
     return "ember"
 
 
-def port_zigbee(sup):
-    """Le chemin stable de la clé Zigbee branchée, ou None."""
+RADIOS_CONNUES = ("zigbee", "zbdongle", "sonoff", "itead", "silicon_labs",
+                  "cc2652", "cc2531", "conbee", "slab_usbtouart", "cp2102", "efr32")
+
+
+def ports_series(sup):
+    """Tous les ports série que la machine expose, tels qu'elle les nomme.
+
+    ⚠️ ON RAPPORTE CE QU'ON VOIT, MÊME QUAND ON NE RECONNAÎT RIEN. Première
+       version : « aucune clé Zigbee reconnue ». Vrai, et inutilisable — on ne
+       savait pas si la clé était absente, mal nommée, ou si le Superviseur
+       répondait autre chose que ce qu'on croyait. Un refus qui ne dit pas ce
+       qu'il a regardé oblige à publier une version pour le savoir.
+    """
     try:
         infos = (sup.materiel() or {}).get("data") or {}
-    except Exception:
-        return None
-    candidats = []
+    except Exception as e:
+        return [], str(e)[:120]
+    vus = []
     for d in infos.get("devices") or []:
         if d.get("subsystem") != "tty":
             continue
-        for chemin in d.get("by_id") and [d["by_id"]] or []:
-            c = chemin.lower()
-            # ⛔ On écarte ce qui n'est pas une radio : un boîtier peut porter
-            #    un modem, un onduleur, un lecteur de carte.
-            if any(m in c for m in ("zigbee", "zbdongle", "sonoff", "silicon_labs",
-                                    "cc2652", "conbee", "slab_usbtouart", "cp2102")):
-                candidats.append(chemin)
-    return candidats[0] if candidats else None
+        vus.append({"nom": d.get("name"), "chemin": d.get("dev_path"),
+                    "stable": d.get("by_id")})
+    return vus, None
+
+
+def port_zigbee(sup):
+    """Le chemin stable de la clé Zigbee branchée, ou None."""
+    vus, _ = ports_series(sup)
+    connus, usb = [], []
+    for d in vus:
+        stable = d.get("stable") or ""
+        c = stable.lower()
+        if any(m in c for m in RADIOS_CONNUES):
+            connus.append(stable)
+        elif "usb-" in c:
+            # ⚠️ UNE RADIO QU'ON NE CONNAÎT PAS RESTE UNE RADIO. Les noms de
+            #    clés changent à chaque révision ; refuser tout ce qui n'est
+            #    pas dans notre liste ferait échouer le kit suivant. Un port
+            #    série USB sur un boîtier qui n'en a aucun d'origine, c'est
+            #    elle. On la prend, après les noms reconnus.
+            usb.append(stable)
+    return (connus or usb or [None])[0]
 
 
 def poser_passerelle_zigbee(ha, sup):
@@ -3093,9 +3118,16 @@ def poser_passerelle_zigbee(ha, sup):
 
     port = port_zigbee(sup)
     if not port:
-        return "failed", {"error":
-            "aucune clé Zigbee reconnue sur la machine : vérifiez qu'elle est "
-            "branchée, si possible sur une rallonge USB"}
+        vus, souci = ports_series(sup)
+        return "failed", {
+            "error": ("la machine n'expose aucun port série : la clé n'est pas "
+                      "branchée, ou pas reconnue par le système"
+                      if not vus else
+                      "aucun des ports série de la machine ne ressemble à une "
+                      "clé Zigbee"),
+            "ports_vus": vus,
+            "souci": souci,
+        }
 
     fait = []
     # 1. Le facteur.
