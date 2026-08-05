@@ -3305,27 +3305,48 @@ def poser_passerelle_zigbee(ha, sup):
                      "modules": fait, "mqtt": lien}
 
 
-def _confirmer_mqtt(ha, essais=6):
-    """Accepte la proposition de branchement MQTT de Home Assistant.
+def _confirmer_mqtt(ha):
+    """Branche Home Assistant sur le broker du boîtier.
 
-    ⚠️ ELLE N'ARRIVE PAS TOUT DE SUITE. Home Assistant repère le module une
-       fois qu'il tourne : on regarde plusieurs fois plutôt qu'une, sinon on
-       conclut « pas de proposition » alors qu'elle arrive deux secondes après.
+    ⛔ SANS CE LIEN, TOUT LE RESTE NE SERT À RIEN. Les deux modules tournent, la
+       clé est reconnue — mais Home Assistant ne parle pas encore au broker,
+       donc `mqtt.publish` n'existe pas, donc l'appairage est refusé. C'est le
+       maillon qu'on oublie parce qu'il ne s'installe pas : il se déclare.
+
+    ⛔ ET ON N'ATTEND PAS QU'UNE PROPOSITION APPARAISSE. Première version : on
+       relisait la liste des parcours en attente, six fois de suite. Cette
+       adresse ne se lit pas — Home Assistant y répond « méthode non
+       autorisée », que l'on prenait pour « rien à voir ». On ouvre donc le
+       parcours nous-mêmes.
+
+       Il propose deux chemins : le module du boîtier, ou un broker extérieur.
+       Le nôtre est sur la machine ; en choisissant le module, Home Assistant
+       fabrique lui-même les identifiants et nous n'avons aucun mot de passe à
+       transporter.
     """
-    for _ in range(essais):
-        try:
-            flux = ha._req("GET", "/api/config/config_entries/flow") or []
-        except Exception:
-            flux = []
-        for f in flux if isinstance(flux, list) else []:
-            if f.get("handler") == "mqtt":
-                try:
-                    ha._req("POST", "/api/config/config_entries/flow/%s" % f.get("flow_id"), {})
-                    return "branché"
-                except Exception as e:
-                    return "à confirmer dans Home Assistant (%s)" % str(e)[:60]
-        time.sleep(5)
-    return "aucune proposition vue — à brancher à la main si l'appairage échoue"
+    try:
+        deja = ha._req("GET", "/api/config/config_entries/entry") or []
+        if any(e.get("domain") == "mqtt" for e in deja if isinstance(e, dict)):
+            return "déjà branché"
+    except Exception:
+        pass
+    try:
+        flux = ha._req("POST", "/api/config/config_entries/flow",
+                       {"handler": "mqtt", "show_advanced_options": False}) or {}
+        ident = flux.get("flow_id")
+        if not ident:
+            return "parcours de branchement refusé"
+        etape = flux
+        if etape.get("type") == "menu":
+            etape = ha._req("POST", "/api/config/config_entries/flow/%s" % ident,
+                            {"next_step_id": "addon"}) or {}
+        if etape.get("type") == "form":
+            etape = ha._req("POST", "/api/config/config_entries/flow/%s" % ident, {}) or {}
+        if etape.get("type") == "create_entry":
+            return "branché"
+        return "à confirmer dans Home Assistant (%s)" % str(etape.get("type"))[:40]
+    except Exception as e:
+        return "à confirmer dans Home Assistant (%s)" % str(e)[:60]
 
 
 def dispatch(cmd, ha, store, sup=None, version_ha=None, differes=None):

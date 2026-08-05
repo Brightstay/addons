@@ -1,3 +1,8 @@
+## 0.6.3 — 2026-08-05
+
+- Le boîtier branche lui-même Home Assistant sur son broker. Sans ce lien, les
+  modules tournaient et la clé était reconnue, mais l'appairage restait refusé.
+
 ## 0.6.2 — 2026-08-05
 
 - Quand le boîtier règle un module, il ne remplace plus toute sa configuration :
