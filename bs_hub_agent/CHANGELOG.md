@@ -1,6 +1,13 @@
 ## 0.6.0 — 2026-08-05
 
-- À DÉCRIRE : ce que cette version change pour un hôte.
+- L'hôte peut ajouter un appareil Zigbee depuis son espace, sans passer par
+  Home Assistant : le boîtier ouvre l'appairage soixante secondes, puis le
+  referme de lui-même.
+- Le boîtier pose lui-même sa passerelle : il reconnaît la clé branchée,
+  installe ce qu'il faut, choisit l'adaptateur correspondant à sa puce et
+  démarre le tout. Il n'installe que les modules du kit, et rien d'autre.
+- Il voit de nouveau les clés USB branchées : il lisait la réponse de la
+  machine de travers et concluait qu'aucun port n'existait.
 
 ## 0.5.24 — 2026-08-05
 
