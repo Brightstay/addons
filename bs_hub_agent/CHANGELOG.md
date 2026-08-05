@@ -1,3 +1,13 @@
+## 0.6.5 — 2026-08-05
+
+- La pose de la passerelle Zigbee attend que Home Assistant ait fini de
+  démarrer : une clé branchée avant l'allumage du boîtier est le cas le plus
+  courant, et c'était celui qui pouvait mal tourner.
+- Elle ne se déclenche que sur une radio reconnue. Une clé d'une autre
+  technologie branchée au même boîtier n'entraîne plus d'installation inutile.
+- Une installation à moitié faite n'est plus prise pour une réussite, et le
+  boîtier cesse de revenir toutes les cinq minutes refaire les mêmes gestes.
+
 ## 0.6.4 — 2026-08-05
 
 - Brancher la clé Zigbee suffit : le boîtier la voit apparaître et pose la

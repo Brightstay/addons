@@ -3234,8 +3234,15 @@ def ports_series(sup):
     return vus, (None if vus else "réponse du Superviseur : %s" % sorted(infos.keys()))
 
 
-def port_zigbee(sup):
-    """Le chemin stable de la clé Zigbee branchée, ou None."""
+def port_zigbee(sup, connu_seulement=False):
+    """Le chemin stable de la clé Zigbee branchée, ou None.
+
+    `connu_seulement` : n'accepte qu'une radio dont on reconnaît le nom. C'est
+    ce que demande la veille automatique — personne n'a rien demandé, donc on
+    ne parie pas. L'ordre venu d'un écran, lui, accepte n'importe quel port
+    série USB : un humain a décidé, et les modèles de clés changent plus vite
+    que nos listes.
+    """
     vus, _ = ports_series(sup)
     connus, usb = [], []
     for d in vus:
@@ -3252,6 +3259,8 @@ def port_zigbee(sup):
             #    série USB sur un boîtier qui n'en a aucun d'origine, c'est
             #    elle. On la prend, après les noms reconnus.
             usb.append(stable)
+    if connu_seulement:
+        return (connus or [None])[0]
     return (connus or usb or [None])[0]
 
 
@@ -3305,34 +3314,85 @@ def poser_passerelle_zigbee(ha, sup):
                      "modules": fait, "mqtt": lien}
 
 
-# Ce que la veille a déjà tenté, pour ne pas recommencer en boucle.
-_VEILLE_ZIGBEE = {"tentee_le": 0.0, "echecs": 0}
+# ⚠️ CE QUI SUIT TOURNE TOUTES LES CINQ MINUTES SUR CHAQUE BOÎTIER DU PARC.
+#    Chaque appel qu'on ajoute ici se paie cinq cents fois par heure quand le
+#    parc aura cinq cents kits. La règle est donc : sortir le plus tôt possible,
+#    et ne rien redemander qu'on sait déjà.
+_VEILLE_ZIGBEE = {"tentee_le": 0.0, "echecs": 0, "pile_vue": None, "vue_le": 0.0}
 # Un échec se retente, mais de plus en plus tard : une clé morte ne doit pas
 # faire réinstaller un module toutes les cinq minutes pendant des mois.
 _REPOS_VEILLE = (5 * 60, 30 * 60, 6 * 3600)
+# On revérifie qu'une passerelle connue est toujours là, mais une fois par
+# heure — pas à chaque tour. Lire tous les états d'un logement bien équipé,
+# c'est plusieurs centaines de lignes pour vérifier la présence d'un mot.
+_FRAICHEUR_PILE = 3600
+# ⛔ Le décompte des échecs vit sur le disque, pas seulement en mémoire. Un
+#    agent qui redémarre en boucle repartirait sinon à zéro à chaque fois, et
+#    l'espacement des tentatives ne servirait à rien — c'est précisément quand
+#    le boîtier va mal qu'il redémarre souvent.
+def _veille_chemin():
+    return os.path.join(PAD_RACINE, "veille_zigbee.json")
+
+
+def _veille_lire():
+    try:
+        with open(_veille_chemin(), encoding="utf-8") as f:
+            d = json.load(f)
+        _VEILLE_ZIGBEE["echecs"] = int(d.get("echecs") or 0)
+    except Exception:
+        pass
+
+
+def _veille_ecrire():
+    try:
+        os.makedirs(PAD_RACINE, exist_ok=True)
+        with open(_veille_chemin(), "w", encoding="utf-8") as f:
+            json.dump({"echecs": _VEILLE_ZIGBEE["echecs"]}, f)
+    except OSError:
+        pass
 
 
 def veiller_sur_la_cle_zigbee(ha, sup):
     """Une clé vient d'apparaître et rien ne la pilote ? On s'en occupe.
 
     Rend un événement à remonter, ou None quand il n'y a rien à dire.
-
-    ⚠️ ON NE FAIT RIEN TANT QU'IL N'Y A RIEN À FAIRE. Pas de clé, ou une
-       passerelle déjà en place : on sort tout de suite, sans un appel de plus.
-       Cette fonction tourne à chaque contact du boîtier, toutes les cinq
-       minutes, sur tout le parc.
     """
     if sup is None:
         return None
-    if pile_zigbee(ha):
+
+    # ⛔ PAS PENDANT LE DÉMARRAGE DE HOME ASSISTANT. Il répond déjà, mais ses
+    #    intégrations arrivent les unes après les autres : on conclurait
+    #    « aucune passerelle » sur une machine qui en a une, et on
+    #    réinstallerait par-dessus. C'est le cas d'une clé branchée AVANT
+    #    l'allumage du boîtier, donc le cas le plus courant à la livraison.
+    pret, _ = ha_pret(ha)
+    if not pret:
         return None
-    if not port_zigbee(sup):
+
+    # La passerelle connue ne se redemande pas à chaque tour.
+    if (_VEILLE_ZIGBEE["pile_vue"]
+            and time.monotonic() - _VEILLE_ZIGBEE["vue_le"] < _FRAICHEUR_PILE):
+        return None
+    pile = pile_zigbee(ha)
+    if pile:
+        _VEILLE_ZIGBEE["pile_vue"] = pile
+        _VEILLE_ZIGBEE["vue_le"] = time.monotonic()
+        return None
+    _VEILLE_ZIGBEE["pile_vue"] = None
+
+    # ⛔ AUTOMATIQUEMENT, ON N'AGIT QUE SUR UNE RADIO QU'ON RECONNAÎT.
+    #    L'ordre venu d'un écran accepte n'importe quel port série USB, parce
+    #    qu'un humain a demandé et que les modèles changent plus vite que nos
+    #    listes. Ici, personne n'a rien demandé : une clé Z-Wave branchée dans
+    #    le même boîtier ferait installer Zigbee2MQTT pointé sur elle, et rien
+    #    ne marcherait — sans que quiconque comprenne pourquoi.
+    if not port_zigbee(sup, connu_seulement=True):
         return None
 
     repos = _REPOS_VEILLE[min(_VEILLE_ZIGBEE["echecs"], len(_REPOS_VEILLE) - 1)]
-    if _VEILLE_ZIGBEE["echecs"] and time.time() - _VEILLE_ZIGBEE["tentee_le"] < repos:
+    if _VEILLE_ZIGBEE["echecs"] and time.monotonic() - _VEILLE_ZIGBEE["tentee_le"] < repos:
         return None
-    _VEILLE_ZIGBEE["tentee_le"] = time.time()
+    _VEILLE_ZIGBEE["tentee_le"] = time.monotonic()
 
     # ⛔ UNE VEILLE NE LÈVE PAS D'EXCEPTION, ELLE RAPPORTE. Celle-ci tourne
     #    dans la boucle du boîtier : une erreur qui remonte y serait attrapée
@@ -3343,14 +3403,26 @@ def veiller_sur_la_cle_zigbee(ha, sup):
         statut, res = poser_passerelle_zigbee(ha, sup)
     except Exception as e:
         statut, res = "failed", {"error": str(e)[:160]}
-    if statut != "acked":
+
+    # ⛔ « INSTALLÉ » NE VEUT PAS DIRE « QUI MARCHE ». Les deux modules peuvent
+    #    tourner et la clé être reconnue : tant que Home Assistant n'est pas
+    #    branché au broker, `mqtt.publish` n'existe pas et l'appairage sera
+    #    refusé. Compter ça comme une réussite, c'était revenir toutes les cinq
+    #    minutes refaire les mêmes six appels, pour toujours, sans rien dire.
+    incomplet = statut == "acked" and str(res.get("mqtt", "")).startswith((
+        "aucune", "à confirmer", "parcours"))
+    if statut != "acked" or incomplet:
         _VEILLE_ZIGBEE["echecs"] += 1
+        _veille_ecrire()
+        motif = str(res.get("error") or res.get("mqtt"))[:160]
         return {"type": "zigbee", "severity": "warning",
                 "payload": {"operation": "passerelle", "phase": "echec",
-                            "detail": str(res.get("error"))[:160]},
+                            "detail": motif},
                 "occurred_at": _now_iso(),
                 "dedup_key": "zigbee-passerelle-echec"}
+
     _VEILLE_ZIGBEE["echecs"] = 0
+    _veille_ecrire()
     return {"type": "zigbee", "severity": "info",
             "payload": {"operation": "passerelle", "phase": "fin",
                         "detail": "clé Zigbee reconnue, passerelle en place"},
@@ -4900,6 +4972,12 @@ def main():
                     sante.append(mesure)
             except Exception as e:
                 print("[hub-agent] instantané KO:", e, flush=True)
+
+            # Le décompte des échecs survit au redémarrage de l'agent : sans
+            # ça, un boîtier qui repart en boucle réessaierait à chaque fois.
+            if not _VEILLE_ZIGBEE.get("relue"):
+                _veille_lire()
+                _VEILLE_ZIGBEE["relue"] = True
 
             # ⛔ BRANCHER LA CLÉ DOIT SUFFIRE.
             #    Elle arrive séparément du boîtier, et c'est l'hôte qui la
