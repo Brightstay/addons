@@ -1,3 +1,16 @@
+## 0.7.1 — 2026-08-06
+
+- L'hôte peut associer ses appareils depuis la tablette du logement, debout
+  devant eux : ajouter un appareil sans fil, ou relier le pont de ses lampes.
+  Les deux gestes sont physiques — réveiller un capteur, appuyer sur un bouton —
+  et demandés depuis l'application, ils arrivaient avec du retard : on disait
+  « appuyez » à quelqu'un qui avait déjà quitté la pièce.
+- Ces gestes ne s'ouvrent qu'avec le code du logement, que le boîtier vérifie
+  lui-même. Le nombre d'essais est limité, et l'échec d'un essai vaut pour
+  toutes les demandes.
+- La liste d'appareils mise de côté par l'exploitant était lue trop tard pour
+  avoir un effet. Elle est désormais prise en compte.
+
 ## 0.7.0 — 2026-08-05
 
 - Le boîtier sait relier le pont Philips Hue déjà présent dans le logement. Les

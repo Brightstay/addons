@@ -1532,6 +1532,14 @@ def config_pour_la_tablette(url_ha, jeton_ha, adresse_locale, en_tete_host=None)
     except Exception:
         conf = {}                            # pas encore configuré : jamais d'erreur
 
+    # ⚠️ LA LISTE DE L'EXPLOITANT SE LIT AVANT LE MÉNAGE. « exclure » figure
+    # parmi les clés réservées — on ne veut pas qu'une liste inventée par le
+    # nuage traverse telle quelle — mais elle était retirée AVANT d'être lue
+    # plus bas : ce que l'exploitant met de côté logement par logement n'aurait
+    # jamais eu d'effet, en silence, le jour où l'application se mettrait à
+    # l'envoyer.
+    de_la_fiche = [e for e in (conf.get("exclure") or []) if isinstance(e, str) and e.strip()]
+
     # Le nuage n'a pas voix au chapitre sur les accès : s'il en avait posé
     # (par erreur ou parce qu'on l'a compromis), il pourrait détourner la
     # tablette vers un faux Home Assistant. On les retire toujours.
@@ -1576,12 +1584,17 @@ def config_pour_la_tablette(url_ha, jeton_ha, adresse_locale, en_tete_host=None)
     #    Elle accepte maintenant. C'est à l'exploitant de décider ce qu'un
     #    voyageur peut toucher — pas au hasard de ce que Home Assistant a
     #    découvert dans le logement.
-    for e in (conf.get("exclure") or []):
-        if isinstance(e, str) and e.strip():
-            interdits.add(e.strip())
+    for e in de_la_fiche:
+        interdits.add(e.strip())
 
     if interdits:
         conf["exclure"] = sorted(interdits)
+
+    # ⚠️ LE DRAPEAU, JAMAIS LE CODE. La page a besoin de savoir s'il EXISTE un
+    # code hôte : avec, elle le demande et le hub tranche ; sans, elle retombe
+    # sur son verrou local, celui d'un poste de démonstration. Elle n'a jamais
+    # besoin de la valeur — ce fichier est servi à tout le Wi-Fi du logement.
+    conf["code_hote"] = bool(_code_maintenance())
     return conf
 
 
@@ -1950,6 +1963,8 @@ def demarrer_serveur_pad(ha_url=None, ha_token=None, ha=None, sup=None):
             route = self.path.split("?")[0]
             if route == "/maintenance":
                 return self._maintenance()
+            if route.startswith("/association/"):
+                return self._association(route[len("/association/"):])
             if route != "/annonce":
                 self.send_response(404); self.end_headers(); return
             try:
@@ -1981,6 +1996,91 @@ def demarrer_serveur_pad(ha_url=None, ha_token=None, ha=None, sup=None):
             self.end_headers()
             self.wfile.write(corps)
 
+        def _corps(self, maxi=2048):
+            try:
+                n = int(self.headers.get("content-length") or 0)
+                c = json.loads(self.rfile.read(min(n, maxi)) or b"{}")
+                return c if isinstance(c, dict) else {}
+            except Exception:
+                return {}
+
+        def _porte_fermee(self, corps, exige_superviseur=False):
+            """La porte de l'espace hôte. Rend True si elle reste fermée.
+
+            ⛔ LE CODE N'EST PAS DANS LA PAGE. Elle envoie ce que l'hôte a tapé,
+            le hub compare, et répond oui ou non. Un code servi à la tablette
+            serait lisible par tout le Wi-Fi du logement — donc pas un code.
+
+            ⚠️ LES ESSAIS SONT COMPTÉS ENSEMBLE POUR TOUTES LES PORTES. Un
+            compteur par porte offrirait cinq essais par porte à qui les essaie
+            toutes : plus il y aurait de portes, plus le code serait facile à
+            deviner. Ce serait l'inverse de ce qu'on veut.
+            """
+            attendu = _code_maintenance()
+            if exige_superviseur and sup is None:
+                attendu = None
+            if not attendu:
+                # Fermé par défaut : sans code posé, aucune porte.
+                self._repondre(403, {"ok": False, "raison": "indisponible"})
+                return True
+            if _maintenance_verrouillee():
+                self._repondre(429, {"ok": False, "raison": "trop d'essais"})
+                return True
+            # Comparaison à durée constante : sans elle, le temps de réponse
+            # trahit le nombre de chiffres justes.
+            if not hmac.compare_digest(str(corps.get("code") or ""), str(attendu)):
+                _MAINTENANCE["essais"].append(time.time())
+                self._repondre(403, {"ok": False, "raison": "code refusé"})
+                return True
+            # Bon code : on repart d'une ardoise propre.
+            _MAINTENANCE["essais"] = []
+            return False
+
+        def _association(self, geste):
+            """L'ESPACE HÔTE : associer ses appareils depuis la tablette.
+
+            Chaque geste est bref sauf un — relier le pont attend que l'hôte
+            appuie sur son bouton, et cette attente EST le geste. Le serveur
+            web répond en fils séparés : la page reste vivante pendant ce
+            temps-là, et les autres écrans aussi."""
+            corps = self._corps()
+            if self._porte_fermee(corps):
+                return
+
+            if geste == "etat":
+                return self._repondre(200, dict({"ok": True}, **etat_association(ha, sup)))
+
+            if geste == "appairage":
+                statut, res = ouvrir_association(ha, corps.get("duree_s"))
+                return self._repondre(200 if statut == "acked" else 409,
+                                      dict({"ok": statut == "acked"}, **res))
+
+            if geste == "arrivees":
+                return self._repondre(200, dict({"ok": True}, **arrivees_association(ha)))
+
+            if geste == "pont":
+                # ⚠️ Une seule liaison à la fois : deux parcours ouverts chez
+                # Home Assistant, et le second efface le premier — l'hôte
+                # appuierait sur son bouton pour un parcours déjà abandonné.
+                if not _VERROU_PONT.acquire(blocking=False):
+                    return self._repondre(409, {"ok": False,
+                                                "error": "une liaison est déjà en cours"})
+                try:
+                    statut, res = relier_pont(ha, corps.get("id"),
+                                              corps.get("secondes") or 45)
+                finally:
+                    _VERROU_PONT.release()
+                try:
+                    journal_evenement("zigbee", "info" if statut == "acked" else "warning",
+                                      {"operation": "pont", "origine": "tablette",
+                                       "resultat": statut})
+                except Exception:
+                    pass
+                return self._repondre(200 if statut == "acked" else 409,
+                                      dict({"ok": statut == "acked"}, **res))
+
+            self._repondre(404, {"ok": False, "raison": "geste inconnu"})
+
         def _maintenance(self):
             """REDÉMARRER HOME ASSISTANT DEPUIS LA TABLETTE.
 
@@ -1996,33 +2096,12 @@ def demarrer_serveur_pad(ha_url=None, ha_token=None, ha=None, sup=None):
             ⛔ ET CE N'EST QUE `core.restart`. Redémarrer la MACHINE couperait
             l'agent : plus aucun chemin de retour, et personne dans le logement
             pour rebrancher. On ne met pas ça à portée d'un salon."""
-            try:
-                n = int(self.headers.get("content-length") or 0)
-                corps = json.loads(self.rfile.read(min(n, 2048)) or b"{}")
-                if not isinstance(corps, dict):
-                    corps = {}
-            except Exception:
-                corps = {}
+            corps = self._corps()
 
             # Sans Superviseur (essais, poste de développement), il n'y a rien
             # à redémarrer : la porte n'existe pas plutôt que d'échouer plus tard.
-            attendu = _code_maintenance() if sup is not None else None
-            if not attendu:
-                # Fermé par défaut : sans code posé, aucune porte.
-                return self._repondre(403, {"ok": False, "raison": "indisponible"})
-
-            if _maintenance_verrouillee():
-                return self._repondre(429, {"ok": False, "raison": "trop d'essais"})
-
-            propose = str(corps.get("code") or "")
-            # Comparaison à durée constante : sans elle, le temps de réponse
-            # trahit le nombre de chiffres justes.
-            if not hmac.compare_digest(propose, str(attendu)):
-                _MAINTENANCE["essais"].append(time.time())
-                return self._repondre(403, {"ok": False, "raison": "code refusé"})
-
-            # Bon code : on repart d'une ardoise propre.
-            _MAINTENANCE["essais"] = []
+            if self._porte_fermee(corps, exige_superviseur=True):
+                return
 
             depuis = time.time() - _MAINTENANCE["dernier_redemarrage"]
             if depuis < MAINTENANCE_REPOS:
@@ -2380,9 +2459,13 @@ def enregistrer_acces_pad(mot_de_passe, ip=None, code_maintenance=None):
     serait un code affiché sur le mur. Il arrive donc par le canal des
     secrets — le même que le mot de passe de la tablette — et c'est le HUB qui
     vérifie, jamais la page. La tablette envoie ce qu'on a tapé et reçoit
-    oui ou non ; elle ne connaît pas la réponse."""
-    if not mot_de_passe:
-        raise ValueError("mot de passe vide")
+    oui ou non ; elle ne connaît pas la réponse.
+
+    ⚠️ UN ORDRE QUI N'APPORTE QUE LE CODE EST VALABLE. La garde exigeait un mot
+    de passe : envoyer le seul code — le cas de l'hôte à qui l'on remet sa clé
+    d'espace hôte, longtemps après la mise en route — faisait échouer l'ordre,
+    alors que le boîtier a DÉJÀ son mot de passe, rangé ici. On refuse quand on
+    n'a rien du tout, pas quand on n'apporte qu'une moitié."""
     os.makedirs(PAD_RACINE, exist_ok=True)
     chemin = _acces_chemin()
     # Un rappel du même mot de passe ne doit pas effacer le code déjà reçu.
@@ -2392,10 +2475,13 @@ def enregistrer_acces_pad(mot_de_passe, ip=None, code_maintenance=None):
             ancien = json.load(f) or {}
     except (OSError, ValueError):
         ancien = {}
+    garde = mot_de_passe or ancien.get("mot_de_passe")
+    if not garde:
+        raise ValueError("mot de passe vide")
     tmp = chemin + ".tmp"
     with open(tmp, "w", encoding="utf-8") as f:
         json.dump({
-            "mot_de_passe": mot_de_passe,
+            "mot_de_passe": garde,
             "ip": ip,
             "code_maintenance": code_maintenance or ancien.get("code_maintenance"),
         }, f)
@@ -3772,6 +3858,117 @@ def relier_pont(ha, ident=None, secondes=60):
 
     _fermer_parcours(ha, parcours)
     return "failed", {"error": "personne n'a appuyé sur le bouton du pont"}
+
+
+# =====================================================================
+# L'ESPACE HÔTE SUR LA TABLETTE — associer ses appareils sans quitter la pièce
+#
+# ⛔ POURQUOI ICI ET PAS SEULEMENT DANS L'APPLICATION. Les deux gestes de
+#    l'association sont des gestes PHYSIQUES : réveiller un capteur, appuyer sur
+#    le bouton d'un pont. Ils se font debout, devant l'objet. Or l'ordre parti de
+#    l'application passe par la file du serveur, que le boîtier relève à son
+#    rythme — mesuré sur le terrain : jusqu'à cent dix secondes. On dit donc à
+#    l'hôte « appuyez » deux minutes après qu'il l'a demandé, et s'il a bougé
+#    entre-temps, il appuie dans le vide et croit son matériel cassé.
+#
+#    Depuis la tablette, il n'y a plus de file : la page et le boîtier sont sur
+#    le même réseau, la réponse est immédiate. « Appuyez maintenant » veut enfin
+#    dire maintenant. C'est la seule raison d'ouvrir ces portes — pas une
+#    duplication de l'application, un endroit où le geste est juste.
+#
+# ⛔ ET C'EST POURQUOI LE CODE SE VÉRIFIE ICI. Ces portes changent le réseau du
+#    logement : elles ouvrent une fenêtre d'appairage et rattachent un pont. La
+#    page qui les appelle est servie sans mot de passe à tout le Wi-Fi du
+#    logement — un voyageur peut la lire. Un verrou écrit DANS la page ne serait
+#    donc qu'un rideau. Le hub compare, la page ne sait rien.
+# =====================================================================
+
+# Notre propre photo d'avant l'ouverture, distincte de celle de la veille.
+_ASSOCIATION = {"avant": None, "ouvert_le": 0.0}
+# Au-delà, ce qui entre n'a plus de rapport avec ce que l'hôte a fait.
+FENETRE_ASSOCIATION = 15 * 60
+# Deux liaisons de pont en parallèle ouvriraient deux parcours chez Home
+# Assistant, et le second effacerait le premier.
+_VERROU_PONT = threading.Lock()
+
+
+def ouvrir_association(ha, duree=None):
+    """Ouvre l'appairage ET retient ce qu'on connaissait avant."""
+    statut, res = ouvrir_appairage(ha, duree)
+    if statut == "acked":
+        # La photo vient d'être prise par `ouvrir_appairage` : on la recopie
+        # plutôt que d'en redemander une (un aller-retour de moins), mais on la
+        # garde à part — voir `arrivees_association`.
+        _ASSOCIATION["avant"] = dict(_APPAIRAGE["avant"] or {})
+        _ASSOCIATION["ouvert_le"] = time.monotonic()
+    return statut, res
+
+
+def arrivees_association(ha):
+    """Ce qui est entré depuis l'ouverture, SANS consommer l'annonce.
+
+    ⛔ ON NE RÉUTILISE PAS `regarder_les_arrivees`. Elle efface sa photo dès
+       qu'elle a trouvé quelque chose, parce qu'elle sert à prévenir UNE fois,
+       par courriel. Si l'écran l'appelait aussi, l'un des deux perdrait
+       l'annonce — et lequel dépendrait de qui passe en premier. Deux usages,
+       deux photos.
+    """
+    if not _ASSOCIATION["avant"]:
+        return {"ouverte": False, "appareils": []}
+    if time.monotonic() - _ASSOCIATION["ouvert_le"] > FENETRE_ASSOCIATION:
+        _ASSOCIATION["avant"] = None
+        return {"ouverte": False, "appareils": []}
+
+    maintenant = _entites(ha)
+    nouvelles = [e for e in maintenant if e not in _ASSOCIATION["avant"]]
+    # Un capteur arrive en six entités — température, humidité, pile… — et
+    # l'hôte n'en a posé qu'un. On regroupe, sinon l'écran ment.
+    appareils = {}
+    for e in nouvelles:
+        appareils.setdefault(_appareil_de(e), maintenant.get(e) or e)
+    return {"ouverte": True, "appareils": sorted(appareils.values())[:20]}
+
+
+def etat_association(ha, sup=None):
+    """Tout ce que l'écran doit savoir, en un seul aller-retour.
+
+    ⚠️ CHAQUE MORCEAU SE DÉBROUILLE SEUL. Home Assistant peut refuser le
+    parcours des ponts sans que l'inventaire soit en cause : un écran qui
+    n'afficherait rien parce qu'UN morceau a manqué serait pire que muet, il
+    serait faux.
+    """
+    etat = {"zigbee": None, "cle": None, "ponts": [], "pont_relie": False,
+            "appareils": []}
+
+    try:
+        etat["zigbee"] = pile_zigbee(ha)
+    except Exception:
+        etat["zigbee"] = None
+
+    # ⚠️ « Pas de passerelle » a deux causes opposées : la clé n'est pas
+    # branchée (l'hôte a un geste à faire), ou elle l'est et son module
+    # s'installe (il n'a qu'à attendre). Sans cette distinction, le même écran
+    # sert les deux — et se trompe une fois sur deux.
+    if etat["zigbee"] is None and sup is not None:
+        try:
+            etat["cle"] = bool(port_zigbee(sup))
+        except Exception:
+            etat["cle"] = None
+
+    try:
+        statut, res = chercher_ponts(ha)
+        if statut == "acked":
+            etat["ponts"] = res.get("ponts") or []
+            etat["pont_relie"] = bool(res.get("deja_relie"))
+    except Exception:
+        pass
+
+    try:
+        etat["appareils"] = (inventaire(ha, sup) or {}).get("appareils") or []
+    except Exception:
+        etat["appareils"] = []
+
+    return etat
 
 
 def dispatch(cmd, ha, store, sup=None, version_ha=None, differes=None):
